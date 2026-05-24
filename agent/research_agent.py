@@ -327,9 +327,10 @@ def plan_question_with_model(client: Any, model: str, query: str, max_tokens: in
         max_tokens=max_tokens,
     )
     raw = response["choices"][0]["message"].get("content", "")
+    # print(f"model plan: {raw}")
     parsed = extract_json_object(raw)
     if parsed is None:
-        raise ValueError(f"Planner did not return valid JSON: {raw[:500]}")
+        raise ValueError(f"Planner did not return valid JSON: {raw}")
     return parsed, raw
 
 
@@ -337,7 +338,7 @@ def initialize_research_state(
     query: str,
     client: Any,
     model: str,
-    planning_max_tokens: int = 1200,
+    planning_max_tokens: int = 2048,
 ) -> Dict[str, Any]:
     if client is None or not model:
         raise ValueError("initialize_research_state requires an available model client and model name.")
@@ -387,7 +388,7 @@ def judge_constraint_support_with_model(
     model: str,
     state: Dict[str, Any],
     max_evidence: int = 12,
-    max_tokens: int = 1600,
+    max_tokens: int = 3072,
 ) -> Dict[str, Any]:
     evidence_docids = {item["docid"] for item in state["evidence_bank"]}
     payload = {
@@ -447,9 +448,10 @@ def judge_constraint_support_with_model(
         max_tokens=max_tokens,
     )
     raw = response["choices"][0]["message"].get("content", "")
+    # print(f"judged constraint: {raw}")
     parsed = extract_json_object(raw)
     if parsed is None:
-        raise ValueError(f"Constraint support judge did not return valid JSON: {raw[:500]}")
+        raise ValueError(f"Constraint support judge did not return valid JSON: {raw}")
     if not isinstance(parsed.get("constraints"), list):
         raise ValueError("Constraint support judge output must include constraints list.")
 
