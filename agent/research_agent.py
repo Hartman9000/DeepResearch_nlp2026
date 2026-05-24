@@ -1,6 +1,5 @@
 import json
 import re
-from copy import deepcopy
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 
@@ -145,37 +144,6 @@ def make_anchor_query(text: str, max_terms: int = 12) -> str:
     return " ".join(terms[:max_terms]) or text[:160]
 
 
-def heuristic_constraints(query: str) -> List[Dict[str, Any]]:
-    normalized = re.sub(r"\s+", " ", query).strip()
-    split_pattern = (
-        r"(?<=[.!?])\s+|;\s+|\s+(?=Additionally\b|According to\b|In one\b|In this\b|From page\b|"
-        r"One of\b|The author\b|This author\b|The pair\b|The librarian\b|The club\b|The company\b)"
-    )
-    chunks = [chunk.strip(" ,") for chunk in re.split(split_pattern, normalized) if chunk.strip(" ,")]
-
-    constraints: List[Dict[str, Any]] = []
-    for idx, chunk in enumerate(chunks, start=1):
-        constraints.append(
-            {
-                "id": f"c{idx}",
-                "text": chunk,
-                "kind": infer_constraint_kind(chunk),
-                "priority": 3 if idx <= 3 else 2,
-            }
-        )
-
-    if not constraints:
-        constraints.append(
-            {
-                "id": "c1",
-                "text": normalized,
-                "kind": "target",
-                "priority": 3,
-            }
-        )
-    return constraints[:12]
-
-
 def infer_constraint_kind(text: str) -> str:
     lowered = text.lower()
     if "what is" in lowered or "can you tell" in lowered or "name of" in lowered:
@@ -189,40 +157,17 @@ def infer_constraint_kind(text: str) -> str:
     return "relation"
 
 
-def fallback_plan(query: str) -> Dict[str, Any]:
-    constraints = heuristic_constraints(query)
-    search_queries = []
-    for constraint in constraints:
-        anchor = make_anchor_query(constraint["text"])
-        if anchor and anchor not in search_queries:
-            search_queries.append(anchor)
-
-    return {
-        "target": {
-            "answer_type": "unknown",
-            "final_question": query,
-        },
-        "constraints": constraints,
-        "subquestions": [
-            {
-                "id": f"sq{idx}",
-                "question": constraint["text"],
-                "depends_on": [],
-                "status": "open",
-            }
-            for idx, constraint in enumerate(constraints, start=1)
-        ],
-        "initial_search_queries": search_queries[:4] or [make_anchor_query(query)],
-    }
-
-
 def normalize_plan(plan: Dict[str, Any], query: str) -> Dict[str, Any]:
-    fallback = fallback_plan(query)
-    target = plan.get("target") if isinstance(plan.get("target"), dict) else fallback["target"]
+    if not isinstance(plan, dict):
+        raise ValueError("Planner output must be a JSON object.")
+
+    target = plan.get("target")
+    if not isinstance(target, dict):
+        raise ValueError("Planner output must include target object.")
 
     raw_constraints = plan.get("constraints")
     if not isinstance(raw_constraints, list) or not raw_constraints:
-        raw_constraints = fallback["constraints"]
+        raise ValueError("Planner output must include non-empty constraints list.")
 
     constraints = []
     for idx, item in enumerate(raw_constraints[:12], start=1):
@@ -245,14 +190,11 @@ def normalize_plan(plan: Dict[str, Any], query: str) -> Dict[str, Any]:
         )
 
     if not constraints:
-        constraints = deepcopy(fallback["constraints"])
-        for item in constraints:
-            item["status"] = "unknown"
-            item["evidence_docids"] = []
+        raise ValueError("Planner produced no valid constraints.")
 
     raw_subquestions = plan.get("subquestions")
     if not isinstance(raw_subquestions, list) or not raw_subquestions:
-        raw_subquestions = fallback["subquestions"]
+        raise ValueError("Planner output must include non-empty subquestions list.")
 
     subquestions = []
     for idx, item in enumerate(raw_subquestions[:12], start=1):
@@ -275,7 +217,7 @@ def normalize_plan(plan: Dict[str, Any], query: str) -> Dict[str, Any]:
 
     raw_queries = plan.get("initial_search_queries")
     if not isinstance(raw_queries, list) or not raw_queries:
-        raw_queries = fallback["initial_search_queries"]
+        raise ValueError("Planner output must include non-empty initial_search_queries list.")
 
     initial_queries = []
     for item in raw_queries:
@@ -284,7 +226,7 @@ def normalize_plan(plan: Dict[str, Any], query: str) -> Dict[str, Any]:
             initial_queries.append(query_text)
 
     if not initial_queries:
-        initial_queries = [make_anchor_query(query)]
+        raise ValueError("Planner produced no valid initial search queries.")
 
     return {
         "target": {
@@ -387,27 +329,19 @@ def plan_question_with_model(client: Any, model: str, query: str, max_tokens: in
     raw = response["choices"][0]["message"].get("content", "")
     parsed = extract_json_object(raw)
     if parsed is None:
-        parsed = fallback_plan(query)
+        raise ValueError(f"Planner did not return valid JSON: {raw[:500]}")
     return parsed, raw
 
 
 def initialize_research_state(
     query: str,
-    client: Optional[Any] = None,
-    model: Optional[str] = None,
+    client: Any,
+    model: str,
     planning_max_tokens: int = 1200,
-    use_model_planner: bool = True,
 ) -> Dict[str, Any]:
-    raw_plan = ""
-    if use_model_planner and client is not None and model:
-        try:
-            plan, raw_plan = plan_question_with_model(client, model, query, max_tokens=planning_max_tokens)
-        except Exception as exc:
-            plan = fallback_plan(query)
-            raw_plan = f"planner_error: {type(exc).__name__}: {exc}"
-    else:
-        plan = fallback_plan(query)
-
+    if client is None or not model:
+        raise ValueError("initialize_research_state requires an available model client and model name.")
+    plan, raw_plan = plan_question_with_model(client, model, query, max_tokens=planning_max_tokens)
     normalized = normalize_plan(plan, query)
     return {
         "original_query": query,
@@ -421,6 +355,7 @@ def initialize_research_state(
         "gaps": [],
         "rounds": [],
         "planner_raw": raw_plan,
+        "support_judgments": [],
         "stop_checks": [],
     }
 
@@ -446,42 +381,121 @@ def update_state_with_search_results(state: Dict[str, Any], search_query: str, r
             )
             existing_docids.add(docid)
 
-    refresh_constraint_status(state)
 
+def judge_constraint_support_with_model(
+    client: Any,
+    model: str,
+    state: Dict[str, Any],
+    max_evidence: int = 12,
+    max_tokens: int = 1600,
+) -> Dict[str, Any]:
+    evidence_docids = {item["docid"] for item in state["evidence_bank"]}
+    payload = {
+        "original_question": state["original_query"],
+        "target": state["target"],
+        "constraints": [
+            {
+                "id": item["id"],
+                "text": item["text"],
+                "kind": item["kind"],
+                "priority": item["priority"],
+            }
+            for item in state["constraints"]
+        ],
+        "evidence": [
+            {
+                "docid": item["docid"],
+                "source_query": item["source_query"],
+                "snippet": item["snippet"],
+            }
+            for item in state["evidence_bank"][-max_evidence:]
+        ],
+    }
+    messages = [
+        {
+            "role": "system",
+            "content": (
+                "You judge whether retrieved snippets support research constraints. "
+                "Return strict JSON only. Use only the provided evidence snippets. "
+                "Do not infer from outside knowledge. Mark a constraint supported only "
+                "when at least one snippet directly supports it. If the evidence is weak, "
+                "partial, ambiguous, or absent, mark unknown. If evidence conflicts, mark contradicted."
+            ),
+        },
+        {
+            "role": "user",
+            "content": (
+                "Assess constraint support for this research state:\n"
+                f"{json.dumps(payload, ensure_ascii=False, indent=2)}\n\n"
+                "Return this JSON schema:\n"
+                "{\n"
+                '  "constraints": [\n'
+                '    {"id": "c1", "status": "supported|unknown|contradicted", '
+                '"evidence_docids": ["docid"], "rationale": "brief reason", '
+                '"suggested_query": "short query if still unknown"}\n'
+                "  ],\n"
+                '  "summary": "brief overall assessment"\n'
+                "}\n"
+                "The evidence_docids list must only contain docids from the provided evidence."
+            ),
+        },
+    ]
+    response = client.simple_chat(
+        model=model,
+        messages=messages,
+        temperature=0.0,
+        max_tokens=max_tokens,
+    )
+    raw = response["choices"][0]["message"].get("content", "")
+    parsed = extract_json_object(raw)
+    if parsed is None:
+        raise ValueError(f"Constraint support judge did not return valid JSON: {raw[:500]}")
+    if not isinstance(parsed.get("constraints"), list):
+        raise ValueError("Constraint support judge output must include constraints list.")
 
-def keyword_overlap_score(left: str, right: str) -> int:
-    left_terms = set(keyword_tokens(left))
-    right_terms = set(keyword_tokens(right))
-    if not left_terms or not right_terms:
-        return 0
-    return len(left_terms & right_terms)
-
-
-def refresh_constraint_status(state: Dict[str, Any]) -> None:
-    for constraint in state["constraints"]:
-        evidence_docids = []
-        for evidence in state["evidence_bank"]:
-            score = keyword_overlap_score(constraint["text"], evidence.get("snippet", ""))
-            if score >= 2:
-                evidence_docids.append(evidence["docid"])
-        constraint["evidence_docids"] = evidence_docids[:5]
-        if evidence_docids:
-            constraint["status"] = "candidate_supported"
-        elif constraint.get("status") != "supported":
-            constraint["status"] = "unknown"
+    by_id = {item["id"]: item for item in state["constraints"]}
+    for judgment in parsed["constraints"]:
+        if not isinstance(judgment, dict):
+            continue
+        constraint_id = str(judgment.get("id", ""))
+        if constraint_id not in by_id:
+            continue
+        status = str(judgment.get("status", "unknown")).lower()
+        if status not in {"supported", "unknown", "contradicted"}:
+            status = "unknown"
+        valid_docids = [
+            str(docid)
+            for docid in judgment.get("evidence_docids", [])
+            if str(docid) in evidence_docids
+        ]
+        constraint = by_id[constraint_id]
+        constraint["status"] = status
+        constraint["evidence_docids"] = valid_docids[:5]
+        constraint["support_rationale"] = str(judgment.get("rationale", "")).strip()
+        constraint["suggested_query"] = str(judgment.get("suggested_query", "")).strip()
 
     gaps = []
     for constraint in state["constraints"]:
-        if constraint["status"] == "unknown" and constraint.get("priority", 1) >= 2:
+        if constraint["status"] in {"unknown", "contradicted"} and constraint.get("priority", 1) >= 2:
+            suggested_query = constraint.get("suggested_query") or make_anchor_query(constraint["text"])
             gaps.append(
                 {
                     "constraint_id": constraint["id"],
                     "text": constraint["text"],
                     "priority": constraint.get("priority", 1),
-                    "suggested_query": make_anchor_query(constraint["text"]),
+                    "status": constraint["status"],
+                    "suggested_query": suggested_query,
                 }
             )
     state["gaps"] = gaps[:6]
+    state["support_judgments"].append(
+        {
+            "raw": raw,
+            "parsed": parsed,
+            "evidence_docids": sorted(evidence_docids),
+        }
+    )
+    return parsed
 
 
 def compact_state_for_prompt(state: Dict[str, Any], max_evidence: int = 8) -> str:
@@ -495,6 +509,7 @@ def compact_state_for_prompt(state: Dict[str, Any], max_evidence: int = 8) -> st
                 "priority": item["priority"],
                 "status": item["status"],
                 "evidence_docids": item["evidence_docids"][:3],
+                "support_rationale": item.get("support_rationale", ""),
             }
             for item in state["constraints"]
         ],
@@ -609,7 +624,7 @@ def next_gap_query(state: Dict[str, Any]) -> Optional[str]:
     return None
 
 
-def run_research_agent_v2(
+def run_research_agent(
     client: Any,
     model: str,
     query: str,
@@ -625,7 +640,6 @@ def run_research_agent_v2(
         client=client,
         model=model,
         planning_max_tokens=planning_max_tokens,
-        use_model_planner=True,
     )
     messages: List[Dict[str, Any]] = [
         {"role": "system", "content": build_system_prompt()},
@@ -654,6 +668,7 @@ def run_research_agent_v2(
             }
         )
 
+    judge_constraint_support_with_model(client, model, state)
     messages.append(build_state_message(state))
 
     for round_id in range(1, max_rounds + 1):
@@ -699,6 +714,7 @@ def run_research_agent_v2(
                     }
                 )
             step["tool_results"] = tool_results
+            judge_constraint_support_with_model(client, model, state)
             messages.append(build_state_message(state))
             continue
 
@@ -745,6 +761,7 @@ def run_research_agent_v2(
             }
         )
         update_state_with_search_results(state, forced_query, executed["tool_result"])
+        judge_constraint_support_with_model(client, model, state)
         step["forced_search"] = {
             "query": forced_query,
             "tool_call": tool_call,
