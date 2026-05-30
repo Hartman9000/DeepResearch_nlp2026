@@ -127,13 +127,21 @@ def get_document_keyword_window(
     case_sensitive: bool = False,
     max_matches: int = 3,
 ) -> List[Dict[str, Any]]:
-    keyword = str(keyword)
+    keyword = str(keyword).strip()
     if not keyword:
         return [{
             "docid": str(docid),
             "keyword": keyword,
             "found": False,
             "error": "keyword is empty",
+            "snippet": "",
+        }]
+    if len(keyword.split()) != 1:
+        return [{
+            "docid": str(docid),
+            "keyword": keyword,
+            "found": False,
+            "error": "keyword must be a single word with no spaces",
             "snippet": "",
         }]
 
@@ -297,7 +305,7 @@ def get_document_window_tool_specs_and_registry(
                 "name": "get_document_window",
                 "description": (
                     "Retrieve short windows around up to the first three occurrences "
-                    "of a keyword inside one BrowseComp-Plus document."
+                    "of one single-word keyword inside one BrowseComp-Plus document."
                 ),
                 "parameters": {
                     "type": "object",
@@ -305,7 +313,7 @@ def get_document_window_tool_specs_and_registry(
                         "docid": {"type": "string", "description": "Document id"},
                         "keyword": {
                             "type": "string",
-                            "description": "Keyword or phrase to locate in the document",
+                            "description": "Single word to locate in the document; spaces are not allowed",
                         },
                     },
                     "required": ["docid", "keyword"],
@@ -361,7 +369,7 @@ def get_agent_tool_specs_and_registry(
                 "name": "get_document_window",
                 "description": (
                     "Retrieve short windows around up to the first three occurrences "
-                    "of a keyword inside one BrowseComp-Plus document."
+                    "of one single-word keyword inside one BrowseComp-Plus document."
                 ),
                 "parameters": {
                     "type": "object",
@@ -369,7 +377,7 @@ def get_agent_tool_specs_and_registry(
                         "docid": {"type": "string", "description": "Document id"},
                         "keyword": {
                             "type": "string",
-                            "description": "Keyword or phrase to locate in the document",
+                            "description": "Single word to locate in the document; spaces are not allowed",
                         },
                     },
                     "required": ["docid", "keyword"],

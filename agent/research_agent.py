@@ -71,9 +71,20 @@ Anchor query rules:
 - Never search the full question.
 - Do not write natural-language questions.
 - Use high-information tokens only.
-- Prefer rare phrases, names, places, years, page numbers, prices, titles, relationships.
-- Good length is usually 4-8 terms.
-- Generate several diverse anchors when the question has multiple clue clusters.
+- Generate 1-3 anchor queries only.
+- Each anchor query should be medium-long, usually 6-12 high-information terms.
+- Prefer rare phrases, names, places, exact years, prices, titles, and relationship anchors.
+- Do not include numeric ranges or decade expressions such as "1980s", "1920s", or "1900-1910".
+- Prefer distinctive clue clusters over broad category words.
+
+Example BrowseComp-Plus style question, for query design only:
+"A privately printed travel book mentions a lighthouse keeper's daughter who translated a mayor's diaries. The same author later wrote a biography whose preface thanks a ceramicist and a harbor archivist. What is the dedication line in that biography?"
+Good anchor_queries:
+[
+  "lighthouse keeper daughter translated mayor diaries",
+  "biography preface thanks ceramicist harbor archivist",
+  "privately printed travel book mayor diaries biography"
+]
 
 Return this schema:
 {
@@ -141,7 +152,8 @@ Decide what to investigate next from the current state.
 
 Available tools:
 - search(query): discover candidate documents, bridge entities, names, titles, dates, or source pages.
-- get_document_window(docid, keyword): inspect a known document around a keyword or phrase. Use it to verify
+- get_document_window(docid, keyword): inspect a known document around one keyword. The keyword must be
+  exactly one word with no spaces. Use it to verify
   precise clues such as acknowledgements, chapter headings, page-like references, names, dates, prices,
   and distinctive phrases inside a document.
 
@@ -152,7 +164,13 @@ Tool-use rules:
 - Use compact high-information search terms.
 - Prefer discovered bridge entities, titles, names, years, distinctive phrases, and relation anchors.
 - Use get_document_window when you already have a promising docid and need local evidence inside it.
+- For get_document_window, pass a single distinctive word only, for example "acknowledgements",
+  "chapter", "spear", "barrel", or a surname. Do not pass phrases like "first chapter".
 - Avoid repeating equivalent tool calls from tool_history.
+- If you use <think>...</think>, you must write a short visible analysis after </think> before any tool call.
+- Your post-think visible content must not be empty. Use the format:
+  <think>private reasoning</think>
+  Analysis: concise reason for the next tool call or final answer.
 
 Final-answer rules:
 - If a candidate answer has direct evidence, all critical constraints are supported, most strong constraints
@@ -273,7 +291,7 @@ def keyword_tokens(text: str) -> List[str]:
     return cleaned
 
 
-def make_anchor_query(text: str, max_terms: int = 8) -> str:
+def make_anchor_query(text: str, max_terms: int = 12) -> str:
     terms = keyword_tokens(text)
     return " ".join(terms[:max_terms]).strip()
 
@@ -287,10 +305,16 @@ def normalize_query(query: Any, original_query: str = "") -> str:
         return ""
 
     tokens = text.split()
-    if len(tokens) > 10:
-        shortened = make_anchor_query(text, max_terms=8)
-        return shortened or " ".join(tokens[:8])
+    if len(tokens) > 12:
+        shortened = make_anchor_query(text, max_terms=12)
+        return shortened or " ".join(tokens[:12])
     return text
+
+
+def remove_range_numbers(text: str) -> str:
+    text = re.sub(r"\b\d{3,4}\s*(?:-|–|—|to)\s*\d{2,4}\b", " ", text, flags=re.IGNORECASE)
+    text = re.sub(r"\b\d{3,4}'?s\b", " ", text, flags=re.IGNORECASE)
+    return " ".join(text.split())
 
 
 def normalize_constraints(raw_constraints: Any) -> List[Dict[str, Any]]:
@@ -333,8 +357,9 @@ def normalize_anchor_queries(raw_queries: Any, original_query: str) -> List[str]
 
     queries: List[str] = []
     seen = set()
-    for item in raw_queries[:6]:
-        query = normalize_query(item, original_query=original_query)
+    for item in raw_queries[:3]:
+        query = normalize_query(remove_range_numbers(str(item)), original_query=original_query)
+        query = remove_range_numbers(query)
         if query and query.lower() not in seen:
             seen.add(query.lower())
             queries.append(query)
