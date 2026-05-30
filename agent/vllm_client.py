@@ -1,4 +1,5 @@
 import json
+import urllib.error
 import urllib.request
 from typing import Any, Dict, Optional
 
@@ -19,8 +20,27 @@ class VLLMClient:
             },
             method="POST",
         )
-        with urllib.request.urlopen(request) as response:
-            return json.loads(response.read().decode("utf-8"))
+        try:
+            with urllib.request.urlopen(request) as response:
+                return json.loads(response.read().decode("utf-8"))
+        except urllib.error.HTTPError as exc:
+            body = exc.read().decode("utf-8", errors="replace")
+            request_summary = {
+                "model": payload.get("model"),
+                "messages": len(payload.get("messages", [])),
+                "max_tokens": payload.get("max_tokens"),
+                "has_tools": "tools" in payload,
+                "tool_choice": payload.get("tool_choice"),
+                "payload_bytes": len(data),
+            }
+            print(
+                "vLLM HTTP error\n"
+                f"status: {exc.code} {exc.reason}\n"
+                f"url: {request.full_url}\n"
+                f"request_summary: {json.dumps(request_summary, ensure_ascii=False)}\n"
+                f"response_body:\n{body}"
+            )
+            raise
 
     def simple_chat(
         self,

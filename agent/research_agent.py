@@ -3,6 +3,9 @@ import re
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 
+VALID_PRIORITIES = {"critical", "strong", "weak"}
+VALID_STATUSES = {"unknown", "supported", "contradicted"}
+
 STOPWORDS = {
     "a",
     "an",
@@ -22,25 +25,20 @@ STOPWORDS = {
     "he",
     "her",
     "his",
-    "i",
     "in",
     "inclusive",
-    "into",
     "is",
     "it",
     "its",
-    "me",
     "of",
     "on",
     "one",
     "or",
-    "per",
     "she",
     "some",
     "that",
     "the",
     "their",
-    "there",
     "this",
     "to",
     "was",
@@ -52,47 +50,139 @@ STOPWORDS = {
     "who",
     "whose",
     "with",
-    "worked",
-    "would",
-    "year",
-    "years",
 }
 
 
-def execute_tool_call(tool_call: Dict[str, Any], registry: Dict[str, Callable[..., Any]]) -> Dict[str, Any]:
-    function = tool_call.get("function", {})
-    name = function.get("name", "")
-    arguments = function.get("arguments", "{}")
+PARSE_PROMPT = """You are parse_agent for BrowseComp-Plus style questions.
+Return strict JSON only. Do not answer the question.
 
-    if isinstance(arguments, str):
-        arguments = json.loads(arguments)
+Your job:
+1. Convert the question into short atomic constraints.
+2. Generate anchor BM25 queries likely to retrieve answer-related snippets.
 
-    if name not in registry:
-        raise ValueError(f"Unknown tool: {name}")
+Constraint rules:
+- Each constraint must be one short checkable fact.
+- Use priority "critical" for facts required to identify the answer.
+- Use priority "strong" for facts that strongly distinguish candidates.
+- Use priority "weak" for helpful but nonessential clues.
+- Every constraint must start with status "unknown".
 
-    result = registry[name](**arguments)
-    return {
-        "tool_name": name,
-        "arguments": arguments,
-        "tool_result": result,
+Anchor query rules:
+- Never search the full question.
+- Do not write natural-language questions.
+- Use high-information tokens only.
+- Prefer rare phrases, names, places, years, page numbers, prices, titles, relationships.
+- Good length is usually 4-8 terms.
+- Generate several diverse anchors when the question has multiple clue clusters.
+
+Return this schema:
+{
+  "target": {"answer_type": "...", "description": "..."},
+  "constraints": [
+    {"id": "c1", "text": "...", "priority": "critical", "status": "unknown"}
+  ],
+  "anchor_queries": ["rare terms query", "..."]
+}
+"""
+
+
+EXTRACT_EVIDENCE_PROMPT = """You are extract_evidence_agent.
+Return strict JSON only. Use only the provided snippets.
+
+Your job:
+1. Select the snippet docids most relevant to the original question.
+2. Update constraint status when the snippet directly supports or contradicts it.
+3. Record candidate answers only when a snippet directly suggests one.
+4. Use analysis_log as prior reasoning context, but ground every evidence update in snippets.
+
+Rules:
+- Do not use outside knowledge.
+- Prefer direct quotes or faithful short summaries from snippets.
+- Mark a constraint supported only when evidence is explicit.
+- Leave ambiguous constraints unknown.
+- A candidate answer must have direct evidence_docids.
+
+Return this schema:
+{
+  "selected_snippets": [
+    {
+      "docid": "123",
+      "why": "why this snippet matters",
     }
+  ],
+  "constraint_updates": [
+    {
+      "id": "c1",
+      "status": "supported",
+      "evidence_docids": ["123"],
+      "rationale": "brief reason"
+    }
+  ],
+  "candidate_answers": [
+    {
+      "answer": "...",
+      "confidence": "low|medium|high",
+      "evidence_docids": ["123"],
+      "rationale": "brief reason"
+    }
+  ],
+  "analysis": "brief visible analysis of what the new evidence changes"
+}
+"""
+
+
+LOOP_PROMPT = """You are loop_agent for a simple deep research agent.
+
+You will receive the current work_message: original question, constraints, evident snippets,
+candidate answers, tool history, and previous visible analyses.
+
+Your response content is your current visible analysis. Keep it concise and useful.
+Decide what to investigate next from the current state.
+
+Available tools:
+- search(query): discover candidate documents, bridge entities, names, titles, dates, or source pages.
+- get_document_window(docid, keyword): inspect a known document around a keyword or phrase. Use it to verify
+  precise clues such as acknowledgements, chapter headings, page-like references, names, dates, prices,
+  and distinctive phrases inside a document.
+
+Tool-use rules:
+- You may call one or more tools when more investigation is useful.
+- Never search the full original question.
+- Do not write natural-language search questions.
+- Use compact high-information search terms.
+- Prefer discovered bridge entities, titles, names, years, distinctive phrases, and relation anchors.
+- Use get_document_window when you already have a promising docid and need local evidence inside it.
+- Avoid repeating equivalent tool calls from tool_history.
+
+Final-answer rules:
+- If a candidate answer has direct evidence, all critical constraints are supported, most strong constraints
+  are supported, and there is no contradiction, stop calling tools and answer in English.
+- Final answer must include brief evidence with docids, an `Exact Answer:` line, and a `Confidence:` line.
+"""
+
+
+def strip_thinking(text: str) -> str:
+    text = re.sub(r"<think>.*?</think>", "", text, flags=re.IGNORECASE | re.DOTALL)
+    text = re.sub(r"</?think>", "", text, flags=re.IGNORECASE)
+    return text.strip()
 
 
 def extract_json_object(text: str) -> Optional[Dict[str, Any]]:
-    """Best-effort extraction for planner outputs that may include prose."""
-    text = text.strip()
+    """Best-effort JSON extraction for small local models that add prose."""
     if not text:
         return None
 
-    fenced = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", text, flags=re.DOTALL)
-    candidates = [text]
+    visible = strip_thinking(text)
+    candidates = [visible, text.strip()]
+
+    fenced = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", visible, flags=re.DOTALL)
     if fenced:
         candidates.insert(0, fenced.group(1))
 
-    first = text.find("{")
-    last = text.rfind("}")
+    first = visible.find("{")
+    last = visible.rfind("}")
     if first != -1 and last != -1 and last > first:
-        candidates.insert(0, text[first : last + 1])
+        candidates.insert(0, visible[first : last + 1])
 
     for candidate in candidates:
         try:
@@ -104,12 +194,72 @@ def extract_json_object(text: str) -> Optional[Dict[str, Any]]:
     return None
 
 
+def append_agent_exchange(
+    messages: List[Dict[str, Any]],
+    system_prompt: str,
+    user_content: str,
+    assistant_content: str,
+) -> None:
+    messages.append({"role": "system", "content": system_prompt})
+    messages.append({"role": "user", "content": user_content})
+    messages.append({"role": "assistant", "content": assistant_content})
+
+
+def call_json_agent(
+    client: Any,
+    model: str,
+    system_prompt: str,
+    user_content: str,
+    max_tokens: int,
+) -> Tuple[Dict[str, Any], str]:
+    response = client.simple_chat(
+        model=model,
+        messages=[
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_content},
+        ],
+        temperature=0.0,
+        max_tokens=max_tokens,
+    )
+    raw = response["choices"][0]["message"].get("content", "")
+    parsed = extract_json_object(raw)
+    if parsed is None:
+        raise ValueError(f"Model did not return valid JSON:\n{raw}")
+    return parsed, raw
+
+
+def normalize_priority(value: Any, default: str = "strong") -> str:
+    if isinstance(value, str):
+        lowered = value.strip().lower()
+        if lowered in VALID_PRIORITIES:
+            return lowered
+        if lowered in {"high", "must", "required"}:
+            return "critical"
+        if lowered in {"medium", "normal"}:
+            return "strong"
+        if lowered in {"low", "minor"}:
+            return "weak"
+    if isinstance(value, int):
+        if value >= 3:
+            return "critical"
+        if value == 2:
+            return "strong"
+        return "weak"
+    return default
+
+
+def normalize_status(value: Any) -> str:
+    if isinstance(value, str) and value.strip().lower() in VALID_STATUSES:
+        return value.strip().lower()
+    return "unknown"
+
+
 def keyword_tokens(text: str) -> List[str]:
     tokens = re.findall(
         r"[A-Za-z][A-Za-z0-9'\-]*|[$]?\d[\d,]*(?:\.\d+)?(?:s|%)?",
         text.lower(),
     )
-    cleaned = []
+    cleaned: List[str] = []
     seen = set()
     for token in tokens:
         token = token.strip("'-.")
@@ -123,54 +273,33 @@ def keyword_tokens(text: str) -> List[str]:
     return cleaned
 
 
-def make_anchor_query(text: str, max_terms: int = 12) -> str:
-    quoted = re.findall(r"['\"]([^'\"]{3,80})['\"]", text)
-    terms = []
-    seen = set()
-
-    for phrase in quoted:
-        phrase = " ".join(keyword_tokens(phrase))
-        if phrase and phrase not in seen:
-            seen.add(phrase)
-            terms.append(phrase)
-
-    for token in keyword_tokens(text):
-        if token not in seen:
-            seen.add(token)
-            terms.append(token)
-        if len(terms) >= max_terms:
-            break
-
-    return " ".join(terms[:max_terms]) or text[:160]
+def make_anchor_query(text: str, max_terms: int = 8) -> str:
+    terms = keyword_tokens(text)
+    return " ".join(terms[:max_terms]).strip()
 
 
-def infer_constraint_kind(text: str) -> str:
-    lowered = text.lower()
-    if "what is" in lowered or "can you tell" in lowered or "name of" in lowered:
-        return "target"
-    if re.search(r"\b(18|19|20)\d{2}s?\b", lowered):
-        return "date"
-    if any(word in lowered for word in ("book", "chapter", "published", "author", "title")):
-        return "bibliographic"
-    if any(word in lowered for word in ("company", "university", "club", "city", "report")):
-        return "entity"
-    return "relation"
+def normalize_query(query: Any, original_query: str = "") -> str:
+    text = " ".join(str(query).split())
+    text = text.strip(" \t\r\n\"'")
+    if not text:
+        return ""
+    if original_query and text.lower() == " ".join(original_query.lower().split()):
+        return ""
+
+    tokens = text.split()
+    if len(tokens) > 10:
+        shortened = make_anchor_query(text, max_terms=8)
+        return shortened or " ".join(tokens[:8])
+    return text
 
 
-def normalize_plan(plan: Dict[str, Any], query: str) -> Dict[str, Any]:
-    if not isinstance(plan, dict):
-        raise ValueError("Planner output must be a JSON object.")
-
-    target = plan.get("target")
-    if not isinstance(target, dict):
-        raise ValueError("Planner output must include target object.")
-
-    raw_constraints = plan.get("constraints")
+def normalize_constraints(raw_constraints: Any) -> List[Dict[str, Any]]:
     if not isinstance(raw_constraints, list) or not raw_constraints:
-        raise ValueError("Planner output must include non-empty constraints list.")
+        raise ValueError("parse_agent output must include a non-empty constraints list.")
 
-    constraints = []
-    for idx, item in enumerate(raw_constraints[:12], start=1):
+    constraints: List[Dict[str, Any]] = []
+    seen_ids = set()
+    for idx, item in enumerate(raw_constraints[:14], start=1):
         if isinstance(item, str):
             item = {"text": item}
         if not isinstance(item, dict):
@@ -178,379 +307,72 @@ def normalize_plan(plan: Dict[str, Any], query: str) -> Dict[str, Any]:
         text = str(item.get("text", "")).strip()
         if not text:
             continue
+        constraint_id = str(item.get("id") or f"c{idx}").strip() or f"c{idx}"
+        if constraint_id in seen_ids:
+            constraint_id = f"c{idx}"
+        seen_ids.add(constraint_id)
         constraints.append(
             {
-                "id": str(item.get("id") or f"c{idx}"),
+                "id": constraint_id,
                 "text": text,
-                "kind": str(item.get("kind") or infer_constraint_kind(text)),
-                "priority": parse_priority(item.get("priority"), 3 if idx <= 3 else 2),
+                "priority": normalize_priority(item.get("priority"), "critical" if idx <= 2 else "strong"),
                 "status": "unknown",
                 "evidence_docids": [],
+                "rationale": "",
             }
         )
 
     if not constraints:
-        raise ValueError("Planner produced no valid constraints.")
+        raise ValueError("parse_agent produced no valid constraints.")
+    return constraints
 
-    raw_subquestions = plan.get("subquestions")
-    if not isinstance(raw_subquestions, list) or not raw_subquestions:
-        raise ValueError("Planner output must include non-empty subquestions list.")
 
-    subquestions = []
-    for idx, item in enumerate(raw_subquestions[:12], start=1):
-        if isinstance(item, str):
-            item = {"question": item}
-        if not isinstance(item, dict):
-            continue
-        question = str(item.get("question", "")).strip()
-        if not question:
-            continue
-        depends_on = item.get("depends_on") if isinstance(item.get("depends_on"), list) else []
-        subquestions.append(
-            {
-                "id": str(item.get("id") or f"sq{idx}"),
-                "question": question,
-                "depends_on": [str(dep) for dep in depends_on],
-                "status": str(item.get("status") or "open"),
-            }
-        )
-
-    raw_queries = plan.get("initial_search_queries")
+def normalize_anchor_queries(raw_queries: Any, original_query: str) -> List[str]:
     if not isinstance(raw_queries, list) or not raw_queries:
-        raise ValueError("Planner output must include non-empty initial_search_queries list.")
+        raise ValueError("parse_agent output must include a non-empty anchor_queries list.")
 
-    initial_queries = []
-    for item in raw_queries:
-        query_text = make_anchor_query(str(item), max_terms=12)
-        if query_text and query_text not in initial_queries:
-            initial_queries.append(query_text)
+    queries: List[str] = []
+    seen = set()
+    for item in raw_queries[:6]:
+        query = normalize_query(item, original_query=original_query)
+        if query and query.lower() not in seen:
+            seen.add(query.lower())
+            queries.append(query)
 
-    if not initial_queries:
-        raise ValueError("Planner produced no valid initial search queries.")
+    if not queries:
+        raise ValueError("parse_agent produced no valid anchor queries.")
+    return queries
 
-    return {
+
+def parse_question_with_model(
+    client: Any,
+    model: str,
+    query: str,
+    max_tokens: int = 1600,
+    messages: Optional[List[Dict[str, Any]]] = None,
+) -> Tuple[Dict[str, Any], str]:
+    user_content = f"Question:\n{query}"
+    parsed, raw = call_json_agent(
+        client=client,
+        model=model,
+        system_prompt=PARSE_PROMPT,
+        user_content=user_content,
+        max_tokens=max_tokens,
+    )
+    if messages is not None:
+        append_agent_exchange(messages, PARSE_PROMPT, user_content, raw)
+    target = parsed.get("target")
+    if not isinstance(target, dict):
+        raise ValueError("parse_agent output must include a valid target.")
+    state_plan = {
         "target": {
             "answer_type": str(target.get("answer_type") or "unknown"),
-            "final_question": str(target.get("final_question") or query),
+            "description": str(target.get("description") or query),
         },
-        "constraints": constraints,
-        "subquestions": subquestions,
-        "initial_search_queries": initial_queries[:4],
+        "constraints": normalize_constraints(parsed.get("constraints")),
+        "anchor_queries": normalize_anchor_queries(parsed.get("anchor_queries"), original_query=query),
     }
-
-
-def parse_priority(value: Any, default: int) -> int:
-    if isinstance(value, str):
-        lowered = value.strip().lower()
-        if lowered in {"high", "critical", "must"}:
-            return 3
-        if lowered in {"medium", "normal"}:
-            return 2
-        if lowered in {"low", "minor"}:
-            return 1
-    try:
-        priority = int(value)
-    except (TypeError, ValueError):
-        priority = default
-    return max(1, min(3, priority))
-
-
-def plan_question_with_model(client: Any, model: str, query: str, max_tokens: int = 1200) -> Tuple[Dict[str, Any], str]:
-    messages = [
-        {
-            "role": "system",
-            "content": (
-                "You initialize a deep research state for hard benchmark questions. "
-                "Return strict JSON only. Do not answer the question. "
-                "Your job is to parse the question into a stable verification checklist "
-                "and an initial search plan for a BM25-only research agent. "
-                "Break the question into atomic constraints, dynamic subquestions, "
-                "and short first-round BM25 search queries. "
-                "Preserve exact names, numbers, dates, page ranges, titles, institutions, "
-                "and quoted phrases exactly as written."
-            ),
-        },
-        {
-            "role": "user",
-            "content": (
-                "Question:\n"
-                f"{query}\n\n"
-                "Return this JSON schema:\n"
-                "{\n"
-                '  "target": {"answer_type": "...", "final_question": "..."},\n'
-                '  "constraints": [\n'
-                '    {"id": "c1", "text": "...", "kind": "entity|date|relation|bibliographic|target", "priority": 3}\n'
-                "  ],\n"
-                '  "subquestions": [\n'
-                '    {"id": "sq1", "question": "...", "depends_on": ["c1"]}\n'
-                "  ],\n"
-                '  "initial_search_queries": ["short rare-term BM25 query", "..."]\n'
-                "}\n\n"
-                "Definitions:\n"
-                "- constraints are the stable checklist used to judge whether a candidate answer is correct. "
-                "They must come from the original question and be atomic, explicit, and checkable.\n"
-                "- subquestions are temporary research tasks used to find bridge entities, source documents, "
-                "or evidence. They guide search and may combine, expand, or operationalize constraints.\n"
-                "- initial_search_queries are first-round BM25 searches for anchor discovery, not final-answer guesses.\n\n"
-                "Constraint rules:\n"
-                "- Each constraint must express one verifiable condition only.\n"
-                "- Include a target constraint when the answer must be a person, title, company, date, location, etc.\n"
-                "- Use priority 3 for critical constraints required for a correct answer.\n"
-                "- Use priority 2 for useful constraints that help distinguish candidates.\n"
-                "- Use priority 1 for minor or weakly distinguishing constraints.\n"
-                "- Do not merge unrelated facts into one constraint.\n\n"
-                "Subquestion rules:\n"
-                "- Subquestions should describe what the agent needs to find or verify next.\n"
-                "- Subquestions should be actionable for search, bridge finding, or candidate verification.\n"
-                "- A subquestion may depend on one or more constraints.\n"
-                "- Do not treat subquestions as final correctness criteria; constraints serve that role.\n\n"
-                "Initial BM25 query rules:\n"
-                "- Generate short, specific queries for the first forced search loop.\n"
-                "- Do not search the full question or use full-sentence wording.\n"
-                "- Prefer rare phrases, exact quoted text, distinctive names, titles, years, institutions, "
-                "document types, page numbers, financial terms, bibliographic terms, and relationship anchors.\n"
-                "- Each query should usually contain 2-6 high-signal terms.\n"
-                "- Include exact phrases in quotes when the question contains distinctive wording.\n"
-                "- Prefer anchor-discovery queries that can reveal bridge entities or source documents.\n"
-                "- Avoid generic constraints such as born, married, author, company, or published unless combined "
-                "with a rare entity, exact phrase, year, title, institution, or document type.\n"
-                "- Include a small variety of query types when possible: rare phrase, source document, "
-                "year/entity anchor, relation bridge, and broad fallback.\n"
-                "- Do not include queries whose only purpose is to guess the final answer directly."
-            ),
-        },
-    ]
-    response = client.simple_chat(
-        model=model,
-        messages=messages,
-        temperature=0.0,
-        max_tokens=max_tokens,
-    )
-    raw = response["choices"][0]["message"].get("content", "")
-    # print(f"model plan: {raw}")
-    parsed = extract_json_object(raw)
-    if parsed is None:
-        raise ValueError(f"Planner did not return valid JSON: {raw}")
-    return parsed, raw
-
-
-def initialize_research_state(
-    query: str,
-    client: Any,
-    model: str,
-    planning_max_tokens: int = 2048,
-) -> Dict[str, Any]:
-    if client is None or not model:
-        raise ValueError("initialize_research_state requires an available model client and model name.")
-    plan, raw_plan = plan_question_with_model(client, model, query, max_tokens=planning_max_tokens)
-    normalized = normalize_plan(plan, query)
-    return {
-        "original_query": query,
-        "target": normalized["target"],
-        "constraints": normalized["constraints"],
-        "subquestions": normalized["subquestions"],
-        "initial_search_queries": normalized["initial_search_queries"],
-        "searched_queries": [],
-        "evidence_bank": [],
-        "candidate_answers": [],
-        "gaps": [],
-        "rounds": [],
-        "planner_raw": raw_plan,
-        "support_judgments": [],
-        "stop_checks": [],
-    }
-
-
-def update_state_with_search_results(state: Dict[str, Any], search_query: str, results: List[Dict[str, Any]]) -> None:
-    state["searched_queries"].append(search_query)
-    existing_docids = {item["docid"] for item in state["evidence_bank"]}
-
-    for rank, result in enumerate(results, start=1):
-        docid = str(result.get("docid", ""))
-        if not docid:
-            continue
-        if docid not in existing_docids:
-            state["evidence_bank"].append(
-                {
-                    "docid": docid,
-                    "url": result.get("url", ""),
-                    "score": result.get("score", 0.0),
-                    "snippet": result.get("snippet", ""),
-                    "source_query": search_query,
-                    "rank": rank,
-                }
-            )
-            existing_docids.add(docid)
-
-
-def judge_constraint_support_with_model(
-    client: Any,
-    model: str,
-    state: Dict[str, Any],
-    max_evidence: int = 12,
-    max_tokens: int = 3072,
-) -> Dict[str, Any]:
-    evidence_docids = {item["docid"] for item in state["evidence_bank"]}
-    payload = {
-        "original_question": state["original_query"],
-        "target": state["target"],
-        "constraints": [
-            {
-                "id": item["id"],
-                "text": item["text"],
-                "kind": item["kind"],
-                "priority": item["priority"],
-            }
-            for item in state["constraints"]
-        ],
-        "evidence": [
-            {
-                "docid": item["docid"],
-                "source_query": item["source_query"],
-                "snippet": item["snippet"],
-            }
-            for item in state["evidence_bank"][-max_evidence:]
-        ],
-    }
-    messages = [
-        {
-            "role": "system",
-            "content": (
-                "You judge whether retrieved snippets support research constraints. "
-                "Return strict JSON only. Use only the provided evidence snippets. "
-                "Do not infer from outside knowledge. Mark a constraint supported only "
-                "when at least one snippet directly supports it. If the evidence is weak, "
-                "partial, ambiguous, or absent, mark unknown. If evidence conflicts, mark contradicted."
-            ),
-        },
-        {
-            "role": "user",
-            "content": (
-                "Assess constraint support for this research state:\n"
-                f"{json.dumps(payload, ensure_ascii=False, indent=2)}\n\n"
-                "Return this JSON schema:\n"
-                "{\n"
-                '  "constraints": [\n'
-                '    {"id": "c1", "status": "supported|unknown|contradicted", '
-                '"evidence_docids": ["docid"], "rationale": "brief reason", '
-                '"suggested_query": "short query if still unknown"}\n'
-                "  ],\n"
-                '  "summary": "brief overall assessment"\n'
-                "}\n"
-                "The evidence_docids list must only contain docids from the provided evidence."
-            ),
-        },
-    ]
-    response = client.simple_chat(
-        model=model,
-        messages=messages,
-        temperature=0.0,
-        max_tokens=max_tokens,
-    )
-    raw = response["choices"][0]["message"].get("content", "")
-    # print(f"judged constraint: {raw}")
-    parsed = extract_json_object(raw)
-    if parsed is None:
-        raise ValueError(f"Constraint support judge did not return valid JSON: {raw}")
-    if not isinstance(parsed.get("constraints"), list):
-        raise ValueError("Constraint support judge output must include constraints list.")
-
-    by_id = {item["id"]: item for item in state["constraints"]}
-    for judgment in parsed["constraints"]:
-        if not isinstance(judgment, dict):
-            continue
-        constraint_id = str(judgment.get("id", ""))
-        if constraint_id not in by_id:
-            continue
-        status = str(judgment.get("status", "unknown")).lower()
-        if status not in {"supported", "unknown", "contradicted"}:
-            status = "unknown"
-        valid_docids = [
-            str(docid)
-            for docid in judgment.get("evidence_docids", [])
-            if str(docid) in evidence_docids
-        ]
-        constraint = by_id[constraint_id]
-        constraint["status"] = status
-        constraint["evidence_docids"] = valid_docids[:5]
-        constraint["support_rationale"] = str(judgment.get("rationale", "")).strip()
-        constraint["suggested_query"] = str(judgment.get("suggested_query", "")).strip()
-
-    gaps = []
-    for constraint in state["constraints"]:
-        if constraint["status"] in {"unknown", "contradicted"} and constraint.get("priority", 1) >= 2:
-            suggested_query = constraint.get("suggested_query") or make_anchor_query(constraint["text"])
-            gaps.append(
-                {
-                    "constraint_id": constraint["id"],
-                    "text": constraint["text"],
-                    "priority": constraint.get("priority", 1),
-                    "status": constraint["status"],
-                    "suggested_query": suggested_query,
-                }
-            )
-    state["gaps"] = gaps[:6]
-    state["support_judgments"].append(
-        {
-            "raw": raw,
-            "parsed": parsed,
-            "evidence_docids": sorted(evidence_docids),
-        }
-    )
-    return parsed
-
-
-def compact_state_for_prompt(state: Dict[str, Any], max_evidence: int = 8) -> str:
-    compact = {
-        "target": state["target"],
-        "constraints": [
-            {
-                "id": item["id"],
-                "text": item["text"],
-                "kind": item["kind"],
-                "priority": item["priority"],
-                "status": item["status"],
-                "evidence_docids": item["evidence_docids"][:3],
-                "support_rationale": item.get("support_rationale", ""),
-            }
-            for item in state["constraints"]
-        ],
-        "open_gaps": state["gaps"][:5],
-        "searched_queries": state["searched_queries"][-8:],
-        "evidence_bank": [
-            {
-                "docid": item["docid"],
-                "source_query": item["source_query"],
-                "snippet": item["snippet"][:700],
-            }
-            for item in state["evidence_bank"][-max_evidence:]
-        ],
-    }
-    return json.dumps(compact, ensure_ascii=False, indent=2)
-
-
-def build_system_prompt() -> str:
-    return (
-        "You are a concise deep research agent for BrowseComp-Plus. "
-        "Use only the provided search tool and the evidence in tool results. "
-        "Do not answer from memory. You must search before giving a final answer. "
-        "Keep track of constraints, evidence, and unresolved gaps. "
-        "Call search when any important constraint is still unsupported. "
-        "Only give a final answer when the evidence is sufficient and cite key docids. "
-        "Final answer must be in Chinese and include: brief evidence, Exact Answer."
-    )
-
-
-def build_state_message(state: Dict[str, Any]) -> Dict[str, str]:
-    return {
-        "role": "user",
-        "content": (
-            "Current research state is below. Continue the research. "
-            "If important gaps remain, call search with one short specific query. "
-            "If the answer is fully supported, provide the final answer.\n\n"
-            f"{compact_state_for_prompt(state)}"
-        ),
-    }
+    return state_plan, raw
 
 
 def make_search_tool_call(call_id: str, query: str) -> Dict[str, Any]:
@@ -564,66 +386,375 @@ def make_search_tool_call(call_id: str, query: str) -> Dict[str, Any]:
     }
 
 
-def run_search_tool(
+def execute_tool_call(tool_call: Dict[str, Any], registry: Dict[str, Callable[..., Any]]) -> Dict[str, Any]:
+    function = tool_call.get("function", {})
+    name = function.get("name", "")
+    arguments = function.get("arguments", "{}")
+    if isinstance(arguments, str):
+        arguments = json.loads(arguments)
+    if name not in registry:
+        raise ValueError(f"Unknown tool: {name}")
+    return {
+        "tool_name": name,
+        "arguments": arguments,
+        "tool_result": registry[name](**arguments),
+    }
+
+
+def merge_search_results(
+    snippet_bank: Dict[str, Dict[str, Any]],
+    search_query: str,
+    results: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    touched: List[Dict[str, Any]] = []
+    for rank, result in enumerate(results, start=1):
+        if isinstance(result, dict) and result.get("found") is False:
+            continue
+        docid = str(result.get("docid", "")).strip()
+        if not docid:
+            continue
+        snippet = str(result.get("snippet", "")).strip()
+        entry = snippet_bank.get(docid)
+        if entry is None:
+            entry = {
+                "docid": docid,
+                "url": result.get("url", ""),
+                "best_score": result.get("score", 0.0),
+                "retrieval_count": 0,
+                "source_queries": [],
+                "snippets": [],
+                "best_rank": rank,
+            }
+            snippet_bank[docid] = entry
+        entry["retrieval_count"] += 1
+        if search_query not in entry["source_queries"]:
+            entry["source_queries"].append(search_query)
+        if snippet and snippet not in entry["snippets"]:
+            entry["snippets"].append(snippet)
+        try:
+            if float(result.get("score", 0.0)) > float(entry.get("best_score", 0.0)):
+                entry["best_score"] = result.get("score", 0.0)
+        except (TypeError, ValueError):
+            pass
+        entry["best_rank"] = min(int(entry.get("best_rank", rank)), rank)
+        touched.append(entry)
+    return touched
+
+
+def compact_snippet(entry: Dict[str, Any]) -> Dict[str, Any]:
+    snippets = entry.get("snippets", [])
+    text = "\n---\n".join(str(item) for item in snippets)
+    return {
+        "docid": entry["docid"],
+        "url": entry.get("url", ""),
+        "best_score": entry.get("best_score", 0.0),
+        "retrieval_count": entry.get("retrieval_count", 0),
+        "source_queries": entry.get("source_queries", []),
+        "snippet": text,
+    }
+
+
+def run_search(
     query: str,
-    registry: Dict[str, Callable[..., Any]],
+    tool_registry: Dict[str, Callable[..., Any]],
     call_id: str,
 ) -> Tuple[Dict[str, Any], Dict[str, Any]]:
     tool_call = make_search_tool_call(call_id, query)
-    executed = execute_tool_call(tool_call, registry)
+    executed = execute_tool_call(tool_call, tool_registry)
     return tool_call, executed
 
 
-def evaluate_stop_condition(
+def summarize_tool_result(executed: Dict[str, Any]) -> Dict[str, Any]:
+    name = executed.get("tool_name", "")
+    result = executed.get("tool_result")
+    if isinstance(result, list):
+        summary = {
+            "num_results": len(result),
+            "docids": [str(item.get("docid", "")) for item in result[:8] if isinstance(item, dict)],
+        }
+        if any(isinstance(item, dict) and "found" in item for item in result):
+            summary["found"] = any(isinstance(item, dict) and item.get("found") for item in result)
+            summary["keywords"] = [
+                str(item.get("keyword", ""))
+                for item in result[:8]
+                if isinstance(item, dict) and item.get("keyword")
+            ]
+        return summary
+    return {"type": type(result).__name__}
+
+
+def merge_tool_result(
     state: Dict[str, Any],
-    final_text: str,
-    round_id: int,
-    max_rounds: int,
-    min_evidence_docs: int = 2,
-    min_constraint_coverage: float = 0.35,
+    snippet_bank: Dict[str, Dict[str, Any]],
+    executed: Dict[str, Any],
+) -> List[Dict[str, Any]]:
+    name = executed.get("tool_name", "")
+    arguments = executed.get("arguments", {})
+    result = executed.get("tool_result")
+    state["tool_history"].append(
+        {
+            "tool_name": name,
+            "arguments": arguments,
+            "summary": summarize_tool_result(executed),
+        }
+    )
+
+    if isinstance(result, list):
+        query = normalize_query(
+            arguments.get("query") or arguments.get("q") or arguments.get("keyword") or name,
+            state["original_query"],
+        )
+        if query:
+            state["searched_queries"].append(query)
+        return merge_search_results(snippet_bank, query, result)
+
+    return []
+
+
+def build_extract_payload(
+    state: Dict[str, Any],
+    snippet_entrys: List[Dict[str, Any]],
+    max_snippets: int = 14,
 ) -> Dict[str, Any]:
-    constraints = state["constraints"]
-    supported = [item for item in constraints if item.get("evidence_docids")]
-    coverage = len(supported) / max(1, len(constraints))
-    high_priority_gaps = [gap for gap in state["gaps"] if gap.get("priority", 1) >= 3]
-    evidence_docids = {item["docid"] for item in state["evidence_bank"]}
-
-    reasons = []
-    if not final_text.strip():
-        reasons.append("empty_final_text")
-    if not state["searched_queries"]:
-        reasons.append("no_search_performed")
-    if len(evidence_docids) < min_evidence_docs:
-        reasons.append("too_few_evidence_docs")
-    if coverage < min_constraint_coverage and round_id < max_rounds:
-        reasons.append("low_constraint_coverage")
-    if high_priority_gaps and round_id < max_rounds:
-        reasons.append("high_priority_gaps_remain")
-
-    passed = not reasons
-    check = {
-        "round_id": round_id,
-        "passed": passed,
-        "reasons": reasons,
-        "coverage": round(coverage, 3),
-        "supported_constraints": len(supported),
-        "total_constraints": len(constraints),
-        "evidence_docs": len(evidence_docids),
+    ranked = sorted(
+        snippet_entrys,
+        key=lambda item: (
+            -int(item.get("retrieval_count", 0)),
+            -float(item.get("best_score", 0.0) or 0.0),
+            int(item.get("best_rank", 999)),
+        ),
+    )
+    return {
+        "original_question": state["original_query"],
+        "target": state["target"],
+        "constraints": state["constraints"],
+        "searched_queries": state["searched_queries"],
+        "tool_history": state["tool_history"],
+        "analysis_log": state["analysis_log"],
+        "current_candidates": state["candidate_answers"][-5:],
+        "snippets": [compact_snippet(item) for item in ranked[:max_snippets]],
     }
-    state["stop_checks"].append(check)
-    return check
 
 
-def next_gap_query(state: Dict[str, Any]) -> Optional[str]:
-    searched = set(state["searched_queries"])
-    for gap in sorted(state["gaps"], key=lambda item: item.get("priority", 1), reverse=True):
-        query = gap.get("suggested_query") or make_anchor_query(gap.get("text", ""))
-        if query and query not in searched:
-            return query
-    for query in state.get("initial_search_queries", []):
-        if query not in searched:
-            return query
-    return None
+def extract_evidence_with_model(
+    client: Any,
+    model: str,
+    state: Dict[str, Any],
+    snippet_entrys: List[Dict[str, Any]],
+    max_tokens: int = 2200,
+    messages: Optional[List[Dict[str, Any]]] = None,
+) -> Tuple[Dict[str, Any], str]:
+    payload = build_extract_payload(state, snippet_entrys)
+    user_content = json.dumps(payload, ensure_ascii=False, indent=2)
+    parsed, raw = call_json_agent(
+        client=client,
+        model=model,
+        system_prompt=EXTRACT_EVIDENCE_PROMPT,
+        user_content=user_content,
+        max_tokens=max_tokens,
+    )
+    if messages is not None:
+        append_agent_exchange(messages, EXTRACT_EVIDENCE_PROMPT, user_content, raw)
+    return parsed, raw
+
+
+def update_state_from_extraction(
+    state: Dict[str, Any],
+    extraction: Dict[str, Any],
+    snippet_bank: Dict[str, Dict[str, Any]],
+) -> None:
+    by_constraint_id = {item["id"]: item for item in state["constraints"]}
+    evidence_by_docid = {item["docid"]: item for item in state["evident_snippets"]}
+
+    for item in extraction.get("selected_snippets", []):
+        if not isinstance(item, dict):
+            continue
+        docid = str(item.get("docid", ""))
+        if docid not in snippet_bank:
+            continue
+        entry = compact_snippet(snippet_bank[docid])
+        entry["why"] = str(item.get("why", "")).strip()
+        if docid in evidence_by_docid:
+            old = evidence_by_docid[docid]
+            if entry["why"] and entry["why"] not in old.get("why", ""):
+                old["why"] = (old.get("why", "") + " " + entry["why"]).strip()
+            old["retrieval_count"] = entry["retrieval_count"]
+            old["source_queries"] = entry["source_queries"]
+        else:
+            state["evident_snippets"].append(entry)
+            evidence_by_docid[docid] = entry
+
+    for update in extraction.get("constraint_updates", []):
+        if not isinstance(update, dict):
+            continue
+        constraint_id = str(update.get("id", ""))
+        if constraint_id not in by_constraint_id:
+            continue
+        status = normalize_status(update.get("status"))
+        constraint = by_constraint_id[constraint_id]
+        if status in {"supported", "contradicted"} or constraint["status"] == "unknown":
+            constraint["status"] = status
+        docids = [
+            str(docid)
+            for docid in update.get("evidence_docids", [])
+            if str(docid) in snippet_bank
+        ]
+        if docids:
+            constraint["evidence_docids"] = list(dict.fromkeys(constraint.get("evidence_docids", []) + docids))[:5]
+        rationale = str(update.get("rationale", "")).strip()
+        if rationale:
+            constraint["rationale"] = rationale
+
+    for candidate in extraction.get("candidate_answers", []):
+        if not isinstance(candidate, dict):
+            continue
+        answer = str(candidate.get("answer", "")).strip()
+        docids = [
+            str(docid)
+            for docid in candidate.get("evidence_docids", [])
+            if str(docid) in snippet_bank
+        ]
+        if not answer or not docids:
+            continue
+        key = answer.lower()
+        existing = next((item for item in state["candidate_answers"] if item["answer"].lower() == key), None)
+        if existing:
+            existing["evidence_docids"] = list(dict.fromkeys(existing["evidence_docids"] + docids))[:5]
+            existing["confidence"] = max_confidence(existing.get("confidence", "low"), candidate.get("confidence", "low"))
+            rationale = str(candidate.get("rationale", "")).strip()
+            if rationale and rationale not in existing.get("rationale", ""):
+                existing["rationale"] = (existing.get("rationale", "") + " " + rationale).strip()
+        else:
+            state["candidate_answers"].append(
+                {
+                    "answer": answer,
+                    "confidence": normalize_confidence(candidate.get("confidence", "low")),
+                    "evidence_docids": docids[:5],
+                    "rationale": str(candidate.get("rationale", "")).strip(),
+                }
+            )
+
+    analysis = str(extraction.get("analysis", "")).strip()
+    if analysis:
+        state["analysis_log"].append(analysis)
+
+
+def normalize_confidence(value: Any) -> str:
+    lowered = str(value).strip().lower()
+    if lowered in {"high", "medium", "low"}:
+        return lowered
+    return "low"
+
+
+def max_confidence(left: str, right: Any) -> str:
+    order = {"low": 1, "medium": 2, "high": 3}
+    right_norm = normalize_confidence(right)
+    return left if order.get(left, 1) >= order.get(right_norm, 1) else right_norm
+
+
+def constraint_summary(state: Dict[str, Any]) -> Dict[str, int]:
+    counts = {"critical": 0, "critical_supported": 0, "strong": 0, "strong_supported": 0, "contradicted": 0}
+    for item in state["constraints"]:
+        priority = item.get("priority", "strong")
+        status = item.get("status", "unknown")
+        if priority == "critical":
+            counts["critical"] += 1
+            if status == "supported":
+                counts["critical_supported"] += 1
+        if priority == "strong":
+            counts["strong"] += 1
+            if status == "supported":
+                counts["strong_supported"] += 1
+        if status == "contradicted":
+            counts["contradicted"] += 1
+    return counts
+
+
+def stop_condition(state: Dict[str, Any]) -> Dict[str, Any]:
+    counts = constraint_summary(state)
+    critical_ok = counts["critical"] == counts["critical_supported"]
+    if counts["strong"] == 0:
+        strong_ok = True
+        strong_ratio = 1.0
+    else:
+        strong_ratio = counts["strong_supported"] / counts["strong"]
+        strong_ok = strong_ratio >= 0.6
+    has_candidate = any(item.get("answer") and item.get("evidence_docids") for item in state["candidate_answers"])
+    no_contradiction = counts["contradicted"] == 0
+    return {
+        "passed": bool(has_candidate and critical_ok and strong_ok and no_contradiction),
+        "candidate_answer_direct_evidence": bool(has_candidate),
+        "critical_constraints_satisfied": bool(critical_ok),
+        "strong_constraints_mostly_satisfied": bool(strong_ok),
+        "strong_supported_ratio": round(strong_ratio, 3),
+        "no_contradiction": bool(no_contradiction),
+    }
+
+
+def build_work_message(state: Dict[str, Any]) -> str:
+    evidence = sorted(
+        state["evident_snippets"],
+        key=lambda item: (-int(item.get("relevance", 1)), -int(item.get("retrieval_count", 0))),
+    )
+    work_state = {
+        "original_question": state["original_query"],
+        "target": state["target"],
+        "constraints": state["constraints"],
+        "candidate_answers": state["candidate_answers"][-6:],
+        "evident_snippets": evidence,
+        "searched_queries": state["searched_queries"][-12:],
+        "tool_history": state["tool_history"][-12:],
+        "stop_condition": stop_condition(state),
+        "analysis_log": state["analysis_log"]
+    }
+    return json.dumps(work_state, ensure_ascii=False, indent=2)
+
+
+def build_loop_messages(state: Dict[str, Any]) -> List[Dict[str, str]]:
+    return [
+        {"role": "system", "content": LOOP_PROMPT},
+        {"role": "user", "content": build_work_message(state)},
+    ]
+
+
+def format_final_answer(answer: str, evidence_docids: List[str], state: Dict[str, Any]) -> str:
+    answer = answer.strip()
+    if not answer and state["candidate_answers"]:
+        answer = state["candidate_answers"][-1]["answer"]
+    docids = list(dict.fromkeys([str(docid) for docid in evidence_docids if docid]))
+    if not docids and state["candidate_answers"]:
+        docids = state["candidate_answers"][-1].get("evidence_docids", [])
+    evidence_line = ", ".join(docids) if docids else "no docid"
+    return f"Explanation: Key evidence comes from docid {evidence_line}.\nExact Answer: {answer}\nConfidence: 70%"
+
+
+def initialize_research_state(
+    query: str,
+    client: Any,
+    model: str,
+    max_tokens: int = 1600,
+    messages: Optional[List[Dict[str, Any]]] = None,
+) -> Dict[str, Any]:
+    plan, raw_plan = parse_question_with_model(
+        client=client,
+        model=model,
+        query=query,
+        max_tokens=max_tokens,
+        messages=messages,
+    )
+    return {
+        "original_query": query,
+        "target": plan["target"],
+        "constraints": plan["constraints"],
+        "anchor_queries": plan["anchor_queries"],
+        "searched_queries": [],
+        "snippet_bank": {},
+        "evident_snippets": [],
+        "candidate_answers": [],
+        "tool_history": [],
+        "analysis_log": [],
+        "raw_outputs": {"parse": raw_plan, "extract": [], "loop": []},
+    }
 
 
 def run_research_agent(
@@ -632,150 +763,141 @@ def run_research_agent(
     query: str,
     tool_specs: List[Dict[str, Any]],
     tool_registry: Dict[str, Callable[..., Any]],
-    max_rounds: int = 10,
-    max_tokens: int = 1024,
-    planning_max_tokens: int = 1200,
-    initial_search_count: int = 2,
+    max_rounds: int = 8,
+    max_tokens: int = 2048,
 ) -> Dict[str, Any]:
+    transcript_messages: List[Dict[str, Any]] = [
+        {
+            "role": "system",
+            "content": "You are a Deep Research Agent. Use search and document-window tools to collect evidence step by step and answer the question in English.",
+        },
+        {"role": "user", "content": query},
+    ]
     state = initialize_research_state(
         query=query,
         client=client,
         model=model,
-        planning_max_tokens=planning_max_tokens,
+        max_tokens=max_tokens,
+        messages=transcript_messages,
     )
-    messages: List[Dict[str, Any]] = [
-        {"role": "system", "content": build_system_prompt()},
-        {"role": "user", "content": query},
-    ]
-    trajectory: List[Dict[str, Any]] = []
+    snippet_bank: Dict[str, Dict[str, Any]] = state["snippet_bank"] # {docid:entry}
 
-    for idx, search_query in enumerate(state["initial_search_queries"][:initial_search_count], start=1):
-        call_id = f"init_search_{idx}"
-        tool_call, executed = run_search_tool(search_query, tool_registry, call_id)
-        messages.append({"role": "assistant", "content": "", "tool_calls": [tool_call]})
-        messages.append(
+    initial_queries = state["anchor_queries"]
+    for idx, search_query in enumerate(initial_queries, start=1):
+        call_id = f"anchor_search_{idx}"
+        tool_call, executed = run_search(search_query, tool_registry, call_id)
+        search_results = executed.get("tool_result", []) # List[RetrievedDocument]
+        transcript_messages.append({"role": "assistant", "content": "", "tool_calls": [tool_call]})
+        transcript_messages.append(
             {
                 "role": "tool",
                 "tool_call_id": call_id,
-                "content": json.dumps(executed["tool_result"], ensure_ascii=False),
+                "content": json.dumps(search_results, ensure_ascii=False),
             }
         )
-        update_state_with_search_results(state, search_query, executed["tool_result"])
-        trajectory.append(
-            {
-                "round_id": 0,
-                "phase": "initial_search",
-                "tool_calls": [tool_call],
-                "tool_results": [executed],
-            }
-        )
+        merge_tool_result(state, snippet_bank, executed)
+    if not snippet_bank:
+        raise ValueError("Initial anchor queries returned no search results.")
 
-    judge_constraint_support_with_model(client, model, state)
-    messages.append(build_state_message(state))
+    extraction, raw = extract_evidence_with_model(
+        client=client,
+        model=model,
+        state=state,
+        snippet_entrys=list(snippet_bank.values()),
+        max_tokens=max_tokens,
+        messages=transcript_messages,
+    )
+    state["raw_outputs"]["extract"].append(raw)
+
+    update_state_from_extraction(state, extraction, snippet_bank)
+
+    final_output = ""
+    status = "max_rounds_reached"
 
     for round_id in range(1, max_rounds + 1):
+        loop_messages = build_loop_messages(state)
         response = client.simple_chat(
             model=model,
-            messages=messages,
+            messages=loop_messages,
             temperature=0.0,
             max_tokens=max_tokens,
             tools=tool_specs,
             tool_choice="auto",
         )
         message = response["choices"][0]["message"]
-        raw_content = message.get("content", "")
+        raw_content = str(message.get("content") or "")
+        visible_content = strip_thinking(raw_content)
         tool_calls = message.get("tool_calls") or []
+        state["raw_outputs"]["loop"].append(raw_content)
+        if visible_content:
+            state["analysis_log"].append(visible_content)
 
-        step: Dict[str, Any] = {
-            "round_id": round_id,
-            "phase": "agent_loop",
-            "assistant_content": raw_content,
-            "tool_calls": tool_calls,
-            "usage": response.get("usage", {}),
-        }
-        trajectory.append(step)
-
-        assistant_message = {"role": "assistant", "content": raw_content}
+        transcript_messages.extend(loop_messages)
+        assistant_message: Dict[str, Any] = {"role": "assistant", "content": raw_content}
         if tool_calls:
             assistant_message["tool_calls"] = tool_calls
-        messages.append(assistant_message)
+        transcript_messages.append(assistant_message)
 
-        if tool_calls:
-            tool_results = []
-            for tool_call in tool_calls:
-                executed = execute_tool_call(tool_call, tool_registry)
-                tool_results.append(executed)
-                arguments = executed["arguments"]
-                search_query = str(arguments.get("query", ""))
-                update_state_with_search_results(state, search_query, executed["tool_result"])
-                messages.append(
-                    {
-                        "role": "tool",
-                        "tool_call_id": tool_call["id"],
-                        "content": json.dumps(executed["tool_result"], ensure_ascii=False),
-                    }
-                )
-            step["tool_results"] = tool_results
-            judge_constraint_support_with_model(client, model, state)
-            messages.append(build_state_message(state))
-            continue
+        if not tool_calls:
+            current_stop = stop_condition(state)
+            if current_stop["passed"]:
+                if "Exact Answer" in visible_content:
+                    final_output = visible_content
+                elif state["candidate_answers"]:
+                    candidate = state["candidate_answers"][-1]
+                    final_output = format_final_answer(
+                        answer=candidate["answer"],
+                        evidence_docids=candidate.get("evidence_docids", []),
+                        state=state,
+                    )
+                else:
+                    final_output = visible_content
+                status = "completed"
+            else:
+                final_output = visible_content
+                status = "stopped_without_tool_calls"
+            if status == "completed" and final_output:
+                transcript_messages[-1]["content"] = final_output
+            break
 
-        stop_check = evaluate_stop_condition(state, raw_content, round_id, max_rounds)
-        step["stop_check"] = stop_check
-        if stop_check["passed"]:
-            return {
-                "query": query,
-                "status": "completed",
-                "final_output": raw_content,
-                "trajectory": trajectory,
-                "messages": messages,
-                "state": state,
-            }
+        round_touched: List[Dict[str, Any]] = []
+        for tool_call in tool_calls:
+            executed = execute_tool_call(tool_call, tool_registry)
+            transcript_messages.append(
+                {
+                    "role": "tool",
+                    "tool_call_id": tool_call["id"],
+                    "content": json.dumps(executed["tool_result"], ensure_ascii=False),
+                }
+            )
+            round_touched.extend(merge_tool_result(state, snippet_bank, executed))
 
-        forced_query = next_gap_query(state)
-        if forced_query is None:
-            return {
-                "query": query,
-                "status": "completed_with_unresolved_gaps",
-                "final_output": raw_content,
-                "trajectory": trajectory,
-                "messages": messages,
-                "state": state,
-            }
+        if round_touched:
+            extraction, raw_extract = extract_evidence_with_model(
+                client=client,
+                model=model,
+                state=state,
+                snippet_entrys=round_touched,
+                max_tokens=max_tokens,
+                messages=transcript_messages,
+            )
+            state["raw_outputs"]["extract"].append(raw_extract)
+            update_state_from_extraction(state, extraction, snippet_bank)
 
-        call_id = f"gap_search_{round_id}"
-        tool_call, executed = run_search_tool(forced_query, tool_registry, call_id)
-        messages.append(
-            {
-                "role": "user",
-                "content": (
-                    "Stop check failed: "
-                    f"{', '.join(stop_check['reasons'])}. Continue with the most important gap."
-                ),
-            }
-        )
-        messages.append({"role": "assistant", "content": "", "tool_calls": [tool_call]})
-        messages.append(
-            {
-                "role": "tool",
-                "tool_call_id": call_id,
-                "content": json.dumps(executed["tool_result"], ensure_ascii=False),
-            }
-        )
-        update_state_with_search_results(state, forced_query, executed["tool_result"])
-        judge_constraint_support_with_model(client, model, state)
-        step["forced_search"] = {
-            "query": forced_query,
-            "tool_call": tool_call,
-            "tool_result": executed,
-        }
-        messages.append(build_state_message(state))
+    else:
+        if state["candidate_answers"]:
+            candidate = state["candidate_answers"][-1]
+            final_output = format_final_answer(
+                answer=candidate["answer"],
+                evidence_docids=candidate.get("evidence_docids", []),
+                state=state,
+            )
+            transcript_messages.append({"role": "assistant", "content": final_output})
+            status = "max_rounds_with_candidate"
 
     return {
         "query": query,
-        "status": "max_rounds_reached",
-        "final_output": "",
-        "trajectory": trajectory,
-        "messages": messages,
-        "state": state,
+        "status": status,
+        "final_output": final_output,
+        "messages": transcript_messages,
     }

@@ -1,1 +1,3 @@
-agent/__pycache__
+agent/__pycache__/
+indexes/
+__pycache__/
