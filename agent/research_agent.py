@@ -101,10 +101,22 @@ EXTRACT_EVIDENCE_PROMPT = """You are extract_evidence_agent.
 Return strict JSON only. Use only the provided snippets.
 
 Your job:
-1. Select the snippet docids most relevant to the original question.
+1. Select 1-3 docids most relevant to the original question.
 2. Update constraint status when the snippet directly supports or contradicts it.
 3. Record candidate answers only when a snippet directly suggests one.
 4. Use analysis_log as prior reasoning context, but ground every evidence update in snippets.
+
+Relevance should be judged from several angles:
+- Direct answer: the snippet contains, or is very likely to contain after a document-window check,
+  the target answer.
+- Semantic/topic match: the snippet is semantically about the same entity, work, event, place,
+  relationship, or clue in the question. Do not rely on keyword overlap alone.
+- Bridge value: the snippet connects key entities, such as a work to its author, an author to
+  another work, or a source page to a table of contents.
+- No redundancy: prefer compact snippets with useful facts. Avoid snippets that contain lots of
+  unrelated material or only match generic words, dates, page numbers, or common phrases.
+- Relation to existing evidence: a new snippet can be important if it connects to an already
+  evident docid or presumed entity, even if it is not the final answer.
 
 Rules:
 - Do not use outside knowledge.

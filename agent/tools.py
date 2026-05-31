@@ -64,8 +64,22 @@ def _query_terms(query: str) -> List[str]:
 
 
 def snippetize_around_query(text: str, query: str, max_chars: int = 1200) -> str:
+    span = query_window_span(text, query, max_chars)
+    if span is None:
+        return snippetize(text, max_chars)
+
+    start, end = span
+    snippet = text[start:end].strip()
+    if start > 0:
+        snippet = "..." + snippet
+    if end < len(text):
+        snippet = snippet.rstrip() + "..."
+    return snippet
+
+
+def query_window_span(text: str, query: str, max_chars: int = 1200) -> Tuple[int, int] | None:
     if not max_chars or max_chars <= 0 or len(text) <= max_chars:
-        return text
+        return 0, len(text)
 
     lowered = text.lower()
     term_positions: Dict[str, List[int]] = {}
@@ -84,7 +98,7 @@ def snippetize_around_query(text: str, query: str, max_chars: int = 1200) -> str
             term_positions[term] = positions
 
     if not term_positions:
-        return snippetize(text, max_chars)
+        return None
 
     window_radius = max_chars // 2
     weighted_positions = []
@@ -111,12 +125,33 @@ def snippetize_around_query(text: str, query: str, max_chars: int = 1200) -> str
     start = max(0, best_position - window_radius)
     end = min(len(text), start + max_chars)
     start = max(0, end - max_chars)
-    snippet = text[start:end].strip()
-    if start > 0:
-        snippet = "..." + snippet
-    if end < len(text):
-        snippet = snippet.rstrip() + "..."
-    return snippet
+    return start, end
+
+
+def snippetize_head_and_query_window(text: str, query: str, max_chars: int = 1600) -> str:
+    if not max_chars or max_chars <= 0 or len(text) <= max_chars:
+        return text
+
+    head_end = min(len(text), max_chars)
+    span = query_window_span(text, query, max_chars)
+    if span is None:
+        return snippetize(text, max_chars)
+
+    window_start, window_end = span
+    if window_end <= head_end:
+        return snippetize(text, max_chars)
+
+    if window_start <= head_end:
+        snippet = text[:window_end].strip()
+        if window_end < len(text):
+            snippet = snippet.rstrip() + "..."
+        return snippet
+
+    head = text[:head_end].rstrip()
+    window = text[window_start:window_end].strip()
+    if window_end < len(text):
+        window = window.rstrip() + "..."
+    return f"{head}\n\n...\n\n{window}"
 
 
 def get_document_keyword_window(
@@ -228,7 +263,7 @@ def retrieve_once(
         {
             "docid": doc["docid"],
             "score": doc["score"],
-            "snippet": snippetize(doc["text"], snippet_max_chars),
+            "snippet": snippetize_head_and_query_window(doc["text"], query, snippet_max_chars),
             "url": doc.get("url", ""),
         }
         for doc in docs
@@ -305,7 +340,9 @@ def get_document_window_tool_specs_and_registry(
                 "name": "get_document_window",
                 "description": (
                     "Retrieve short windows around up to the first three occurrences "
-                    "of one single-word keyword inside one BrowseComp-Plus document."
+                    "of one single-word keyword inside one BrowseComp-Plus document. "
+                    "Use this after search finds a promising docid to verify chapter headings, "
+                    "acknowledgements, names, dates, prices, page clues, or rare phrases."
                 ),
                 "parameters": {
                     "type": "object",
@@ -369,7 +406,9 @@ def get_agent_tool_specs_and_registry(
                 "name": "get_document_window",
                 "description": (
                     "Retrieve short windows around up to the first three occurrences "
-                    "of one single-word keyword inside one BrowseComp-Plus document."
+                    "of one single-word keyword inside one BrowseComp-Plus document. "
+                    "Use this after search finds a promising docid to verify chapter headings, "
+                    "acknowledgements, names, dates, prices, page clues, or rare phrases."
                 ),
                 "parameters": {
                     "type": "object",
