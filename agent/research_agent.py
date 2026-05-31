@@ -74,16 +74,27 @@ Anchor query rules:
 - Generate 1-3 anchor queries only.
 - Each anchor query should be medium-long, usually 6-12 high-information terms.
 - Prefer rare phrases, names, places, exact years, prices, titles, and relationship anchors.
-- Do not include numeric ranges or decade expressions such as "1980s", "1920s", or "1900-1910".
+- Never include numeric ranges, decade expressions, or page ranges in anchor queries such as "1980s", "1920s", "1900-1910", "1900 to 1910",
+    "1900 1910", "pages 332-339", and "332 339".
+- Never include numeric ranges, decade expressions, or page ranges in anchor queries such as "1980s", "1920s", "1900-1910", "1900 to 1910",
+    "1900 1910", "pages 332-339", and "332 339".
+- Do not make broad date-only bridge queries such as "author married 1890s second book 1900-1910".
 - Prefer distinctive clue clusters over broad category words.
 
 Example BrowseComp-Plus style question, for query design only:
-"A privately printed travel book mentions a lighthouse keeper's daughter who translated a mayor's diaries. The same author later wrote a biography whose preface thanks a ceramicist and a harbor archivist. What is the dedication line in that biography?"
+"A travel book first published in the 1910s by a press founded in the 1870s describes, on pages 118-124, a brass astrolabe carried by a clockmaker's apprentice. Later pages mention a lawsuit involving a lighthouse keeper's daughter who translated a mayor's diaries. The author married in the 1890s. The same author wrote another book between 1900-1905 whose preface thanks a ceramicist and a harbor archivist. What is the dedication line in the later book?"
 Good anchor_queries:
 [
-  "lighthouse keeper daughter translated mayor diaries",
-  "biography preface thanks ceramicist harbor archivist",
-  "privately printed travel book mayor diaries biography"
+  "brass astrolabe clockmaker apprentice travel book",
+  "later book preface thanks ceramicist harbor archivist",
+  "lighthouse keeper daughter translated mayor diaries"
+]
+Bad anchor_queries that must NOT be generated:
+[
+  "travel book 1910s press 1870s pages 118-124",
+  "author married 1890s later book 1900-1905",
+  "book 1900 1905 dedication line",
+  "pages 118 124 brass astrolabe"
 ]
 
 Return this schema:
@@ -170,14 +181,40 @@ Available tools:
   and distinctive phrases inside a document.
 
 Tool-use rules:
-- You may call one or more tools when more investigation is useful.
+- You must call 2-4 tools when more investigation is useful.
 - Never search the full original question.
 - Do not write natural-language search questions.
 - Use compact high-information search terms.
-- Prefer discovered bridge entities, titles, names, years, distinctive phrases, and relation anchors.
+- Prefer discovered bridge entities, titles, names, single exact years when they are distinctive,
+  distinctive phrases, and relation anchors.
+- Never include numeric ranges, decade expressions, or page ranges in search queries.
+  Forbidden numeric forms include "1980s", "1920s", "1900-1910", "1900 to 1910",
+  "1900 1910", "pages 332-339", and "332 339".
+- Use search when you need to discover an unknown entity or bridge: a title, author, publisher,
+  venue, related work, source page, biography page, bibliography page, or exact document containing
+  a distinctive clue.
+- Search queries should combine rare terms from one coherent clue cluster. Avoid broad queries that
+  are mostly relation words and dates, such as "author married second book",
+  "author married 1890s second book 1900-1910", or "book 1900 1910".
 - Use get_document_window when you already have a promising docid and need local evidence inside it.
+  This is usually better than another broad search when the next fact is probably inside that known
+  source document.
+- Use get_document_window for local verification tasks: table of contents, chapter title,
+  acknowledgement names, a page-like clue, an object description, a marriage mention, a price, a
+  surname, or a distinctive phrase. Good keywords are single words such as "chapter", "contents",
+  "preface", "acknowledgements", "married", "spear", "barrel", or a surname.
 - For get_document_window, pass a single distinctive word only, for example "acknowledgements",
   "chapter", "spear", "barrel", or a surname. Do not pass phrases like "first chapter".
+- Example investigation pattern for a non-dataset question:
+  Question clue: a 1910s travel book has a "brass astrolabe" scene; the same author wrote a later
+  book with a dedication line.
+  Useful next calls after search finds docid 24680 for the possible later book:
+  1. search("brass astrolabe clockmaker apprentice travel book") to identify the first work.
+  2. search("identified author ceramicist harbor archivist") to find the later work or author page.
+  3. get_document_window(docid="24680", keyword="contents") to inspect the table of contents.
+  4. get_document_window(docid="24680", keyword="dedication") to inspect the target text.
+  The window calls are important because the answer may be inside a known book page even when search
+  snippets only show the title page or beginning of the document.
 - Avoid repeating equivalent tool calls from tool_history.
 - If you use <think>...</think>, you must write a short visible analysis after </think> before any tool call.
 - Your post-think visible content must not be empty. Use the format:
@@ -187,6 +224,9 @@ Tool-use rules:
 Final-answer rules:
 - If a candidate answer has direct evidence, all critical constraints are supported, most strong constraints
   are supported, and there is no contradiction, stop calling tools and answer in English.
+- When you think you have the final answer, you must clearly explain why before the Exact Answer line.
+  Include which snippets/docids contain the answer string, how the relevant entities are connected,
+  and which constraints are satisfied. This explanation will be checked by a verifier.
 - Final answer must include brief evidence with docids, an `Exact Answer:` line, and a `Confidence:` line.
 """
 

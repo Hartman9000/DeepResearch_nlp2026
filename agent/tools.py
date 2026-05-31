@@ -246,7 +246,7 @@ def get_document_keyword_window(
 #         {
 #             "docid": doc["docid"],
 #             "score": doc["score"],
-#             "snippet": snippetize_around_query(doc["text"], query, snippet_max_chars),
+#             "snippet": snippetize(doc["text"], snippet_max_chars),
 #             "url": doc.get("url", ""),
 #         }
 #         for doc in docs
