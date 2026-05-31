@@ -112,7 +112,7 @@ EXTRACT_EVIDENCE_PROMPT = """You are extract_evidence_agent.
 Return strict JSON only. Use only the provided snippets.
 
 Your job:
-1. Select 1-3 docids most relevant to the original question.
+1. Select 1-5 docids most relevant to the original question.
 2. Update constraint status when the snippet directly supports or contradicts it.
 3. Record candidate answers only when a snippet directly suggests one.
 4. Use analysis_log as prior reasoning context, but ground every evidence update in snippets.
