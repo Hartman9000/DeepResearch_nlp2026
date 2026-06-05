@@ -28,7 +28,7 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from agent.dataset_utils import load_jsonl
 from agent.eval import run_evaluation
-from agent.tools import build_searcher, get_agent_tool_specs_and_registry
+from agent.tools import build_searcher, get_agent_tool_specs_and_registry, get_basic_tool_specs_and_registry
 from agent.vllm_client import VLLMClient
 from basic.agent import run_basic_agent
 from open_track.research_agent import run_research_agent as run_open_track_agent
@@ -94,11 +94,17 @@ def build_error_record(row: Dict[str, Any], exc: BaseException) -> Dict[str, Any
 
 def run_selected_agent(args: argparse.Namespace, client: VLLMClient, searcher: Any, question: str) -> Dict[str, Any]:
     if args.agent == "basic":
+        _tool_specs, tool_registry = get_basic_tool_specs_and_registry(
+            searcher=searcher,
+            k=args.top_k,
+            snippet_max_chars=args.snippet_max_chars,
+        )
         return run_basic_agent(
             client=client,
             model=args.model,
             question=question,
             searcher=searcher,
+            search_fn=tool_registry["search"],
             top_k=args.top_k,
             max_rounds=args.max_rounds,
             max_tokens=args.max_tokens,

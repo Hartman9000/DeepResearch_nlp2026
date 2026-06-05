@@ -1,10 +1,8 @@
 import json
 import re
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
-from agent.tools import retrieve_once
-
-from .prompts import BASIC_LOOP_SYSTEM_PROMPT
+from .prompts import BASIC_FINAL_SYSTEM_PROMPT, BASIC_LOOP_SYSTEM_PROMPT
 
 
 def strip_thinking(text: str) -> str:
@@ -173,6 +171,48 @@ def build_decision_messages(
     ]
 
 
+def build_final_messages(
+    question: str,
+    status: str,
+    search_rounds: List[Dict[str, Any]],
+    confirmed_facts: List[str],
+    candidate_answers: List[Dict[str, Any]],
+    previous_queries: List[str],
+    recent_rounds: int,
+    context_snippet_chars: int,
+) -> List[Dict[str, str]]:
+    older = search_rounds[:-recent_rounds] if recent_rounds > 0 else search_rounds
+    recent = search_rounds[-recent_rounds:] if recent_rounds > 0 else []
+    recent_payload = []
+    for item in recent:
+        recent_payload.append(
+            {
+                "round": item.get("round"),
+                "query": item.get("query"),
+                "new_docids": item.get("new_docids", []),
+                "documents": [
+                    compact_result(result, context_snippet_chars)
+                    for result in item.get("results", [])
+                ],
+                "decision": item.get("decision", {}),
+            }
+        )
+
+    payload = {
+        "original_question": question,
+        "stop_status": status,
+        "previous_queries": previous_queries,
+        "confirmed_key_facts": confirmed_facts,
+        "candidate_answers": candidate_answers[-8:],
+        "older_rounds_summary": summarize_older_rounds(older),
+        "recent_search_rounds": recent_payload,
+    }
+    return [
+        {"role": "system", "content": BASIC_FINAL_SYSTEM_PROMPT},
+        {"role": "user", "content": json.dumps(payload, ensure_ascii=False, indent=2)},
+    ]
+
+
 def format_final_answer(decision: Dict[str, Any], status: str) -> str:
     answer = str(decision.get("final_answer", "")).strip()
     confidence = normalize_confidence(decision.get("confidence"))
@@ -190,6 +230,7 @@ def run_basic_agent(
     model: str,
     question: str,
     searcher: Any,
+    search_fn: Optional[Callable[[str], List[Dict[str, Any]]]] = None,
     top_k: int = 5,
     max_rounds: int = 6,
     max_tokens: int = 2048,
@@ -198,6 +239,16 @@ def run_basic_agent(
     context_snippet_chars: int = 1200,
     initial_query: Optional[str] = None,
 ) -> Dict[str, Any]:
+    if search_fn is None:
+        from agent.tools import get_basic_tool_specs_and_registry
+
+        _, registry = get_basic_tool_specs_and_registry(
+            searcher=searcher,
+            k=top_k,
+            snippet_max_chars=snippet_max_chars,
+        )
+        search_fn = registry["search"]
+
     transcript_messages: List[Dict[str, Any]] = [
         {
             "role": "system",
@@ -231,12 +282,7 @@ def run_basic_agent(
 
         call_id = f"search_{round_id}"
         tool_call = make_search_tool_call(call_id, search_query)
-        results = retrieve_once(
-            searcher=searcher,
-            query=search_query,
-            k=top_k,
-            snippet_max_chars=snippet_max_chars,
-        )
+        results = search_fn(search_query)
         previous_queries.append(search_query)
 
         new_docids = []
@@ -326,7 +372,44 @@ def run_basic_agent(
             break
 
     if not final_output:
-        final_output = format_final_answer(last_decision, status)
+        final_messages = build_final_messages(
+            question=question,
+            status=status,
+            search_rounds=search_rounds,
+            confirmed_facts=confirmed_facts,
+            candidate_answers=candidate_answers,
+            previous_queries=previous_queries,
+            recent_rounds=recent_rounds,
+            context_snippet_chars=context_snippet_chars,
+        )
+        response = client.simple_chat(
+            model=model,
+            messages=final_messages,
+            temperature=0.0,
+            max_tokens=max_tokens,
+        )
+        raw_final_content = response["choices"][0]["message"].get("content", "")
+        parsed_final = extract_json_object(raw_final_content)
+        final_decision = normalize_decision(parsed_final)
+        if not final_decision["final_answer"] and candidate_answers:
+            candidate = candidate_answers[-1]
+            final_decision = normalize_decision(
+                {
+                    "analysis": (
+                        "The search loop stopped before full verification, so this is the most "
+                        "plausible candidate from the accumulated evidence."
+                    ),
+                    "final_answer": candidate.get("answer", ""),
+                    "confidence": candidate.get("confidence", "low"),
+                    "used_docids": candidate.get("used_docids", []),
+                    "key_facts": [],
+                    "next_query": "",
+                }
+            )
+        if not final_decision["final_answer"]:
+            final_decision = last_decision
+        final_output = format_final_answer(final_decision, status)
+        transcript_messages.extend(final_messages)
         transcript_messages.append({"role": "assistant", "content": final_output})
 
     return {

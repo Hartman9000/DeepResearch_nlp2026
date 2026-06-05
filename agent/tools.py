@@ -317,6 +317,47 @@ def get_search_tool_specs_and_registry(
     return tools, {"search": search}
 
 
+def get_basic_tool_specs_and_registry(
+    searcher: BrowseCompBM25Searcher,
+    k: int = 5,
+    snippet_max_chars: int = 1200,
+) -> Tuple[List[Dict[str, Any]], Dict[str, Callable[..., Any]]]:
+    def search(query: str) -> List[Dict[str, Any]]:
+        docs = searcher.search(query, k=k)
+        return [
+            {
+                "docid": doc["docid"],
+                "score": doc["score"],
+                "snippet": snippetize(doc["text"], snippet_max_chars),
+                "url": doc.get("url", ""),
+            }
+            for doc in docs
+        ]
+
+    tools = [
+        {
+            "type": "function",
+            "function": {
+                "name": "search",
+                "description": (
+                    f"Basic BM25 search over BrowseComp-Plus. Return top-{k} results "
+                    "with docid, score, url, and a simple leading document snippet. "
+                    "The snippet is produced with snippetize(doc['text'], snippet_max_chars); "
+                    "it does not include query-window merging or document-window lookup."
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "query": {"type": "string", "description": "Search query"},
+                    },
+                    "required": ["query"],
+                },
+            },
+        }
+    ]
+    return tools, {"search": search}
+
+
 def get_document_window_tool_specs_and_registry(
     searcher: BrowseCompBM25Searcher,
     window_chars: int = 1200,
