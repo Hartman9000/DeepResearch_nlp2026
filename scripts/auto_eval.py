@@ -30,12 +30,19 @@ from agent.dataset_utils import load_jsonl
 from agent.eval import run_evaluation
 from agent.tools import build_searcher, get_agent_tool_specs_and_registry
 from agent.vllm_client import VLLMClient
-from open_track.research_agent import run_research_agent
+from basic.agent import run_basic_agent
+from open_track.research_agent import run_research_agent as run_open_track_agent
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Run the current research agent on BrowseComp-Plus hard50 and evaluate the 50 results."
+    )
+    parser.add_argument(
+        "--agent",
+        choices=["open_track", "basic"],
+        default="open_track",
+        help="Agent implementation to evaluate.",
     )
     parser.add_argument("--dataset", default="browsecomp_plus_hard50.jsonl", help="BrowseComp-Plus hard50 JSONL path.")
     parser.add_argument("--index-path", default="indexes/browsecomp_plus_bm25.sqlite", help="BM25 SQLite index path.")
@@ -49,6 +56,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-rounds", type=int, default=10, help="Maximum research-agent loop rounds.")
     parser.add_argument("--max-tokens", type=int, default=4096, help="max_tokens for research-agent model calls.")
     parser.add_argument("--eval-max-tokens", type=int, default=4096, help="max_tokens for judge calls.")
+    parser.add_argument("--recent-rounds", type=int, default=3, help="Basic agent: recent search rounds kept in full context.")
+    parser.add_argument(
+        "--context-snippet-chars",
+        type=int,
+        default=1200,
+        help="Basic agent: maximum snippet characters shown per recent result.",
+    )
     parser.add_argument("--output-dir", default="runs", help="Directory for submission, eval, and summary files.")
     return parser.parse_args()
 
@@ -62,6 +76,7 @@ def resolve_path(path: str) -> Path:
 
 def build_error_record(row: Dict[str, Any], exc: BaseException) -> Dict[str, Any]:
     return {
+        "agent": "",
         "query_id": row.get("query_id", ""),
         "query": row.get("query", ""),
         "gold_answer": row.get("answer", ""),
@@ -77,33 +92,52 @@ def build_error_record(row: Dict[str, Any], exc: BaseException) -> Dict[str, Any
     }
 
 
-def run_predictions(args: argparse.Namespace, rows: List[Dict[str, Any]], submission_path: Path) -> None:
-    client = VLLMClient(base_url=args.base_url, api_key=args.api_key)
-    searcher = build_searcher(index_path=str(resolve_path(args.index_path)))
+def run_selected_agent(args: argparse.Namespace, client: VLLMClient, searcher: Any, question: str) -> Dict[str, Any]:
+    if args.agent == "basic":
+        return run_basic_agent(
+            client=client,
+            model=args.model,
+            question=question,
+            searcher=searcher,
+            top_k=args.top_k,
+            max_rounds=args.max_rounds,
+            max_tokens=args.max_tokens,
+            snippet_max_chars=args.snippet_max_chars,
+            recent_rounds=args.recent_rounds,
+            context_snippet_chars=args.context_snippet_chars,
+        )
+
     tool_specs, tool_registry = get_agent_tool_specs_and_registry(
         searcher=searcher,
         k=args.top_k,
         snippet_max_chars=args.snippet_max_chars,
         window_chars=args.window_chars,
     )
+    return run_open_track_agent(
+        client=client,
+        model=args.model,
+        query=question,
+        tool_specs=tool_specs,
+        tool_registry=tool_registry,
+        max_rounds=args.max_rounds,
+        max_tokens=args.max_tokens,
+    )
+
+
+def run_predictions(args: argparse.Namespace, rows: List[Dict[str, Any]], submission_path: Path) -> None:
+    client = VLLMClient(base_url=args.base_url, api_key=args.api_key)
+    searcher = build_searcher(index_path=str(resolve_path(args.index_path)))
 
     submission_path.parent.mkdir(parents=True, exist_ok=True)
     with submission_path.open("w", encoding="utf-8") as fout:
         for idx, row in enumerate(rows, start=1):
             query_id = str(row.get("query_id", ""))
-            print(f"[predict {idx:02d}/{len(rows):02d}] query_id={query_id}")
+            print(f"[predict {idx:02d}/{len(rows):02d}] agent={args.agent} query_id={query_id}")
 
             try:
-                result = run_research_agent(
-                    client=client,
-                    model=args.model,
-                    query=row["query"],
-                    tool_specs=tool_specs,
-                    tool_registry=tool_registry,
-                    max_rounds=args.max_rounds,
-                    max_tokens=args.max_tokens,
-                )
+                result = run_selected_agent(args=args, client=client, searcher=searcher, question=row["query"])
                 record = {
+                    "agent": args.agent,
                     "query_id": row["query_id"],
                     "query": row["query"],
                     "gold_answer": row.get("answer", ""),
@@ -111,9 +145,13 @@ def run_predictions(args: argparse.Namespace, rows: List[Dict[str, Any]], submis
                     "predicted_answer": result.get("final_output", ""),
                     "messages": result.get("messages", []),
                 }
+                for key in ("search_rounds", "confirmed_facts", "candidate_answers"):
+                    if key in result:
+                        record[key] = result[key]
             except Exception as exc:
                 print(f"  ERROR: {repr(exc)}")
                 record = build_error_record(row, exc)
+                record["agent"] = args.agent
 
             fout.write(json.dumps(record, ensure_ascii=False) + "\n")
             preview = str(record.get("predicted_answer", "")).replace("\n", " ")[:180]
@@ -143,9 +181,9 @@ def main() -> None:
     dataset_path = resolve_path(args.dataset)
     output_dir = resolve_path(args.output_dir)
     timestamp = datetime.now().strftime("%m%d_%H%M")
-    submission_path = output_dir / f"submission_{timestamp}.jsonl"
-    eval_path = output_dir / f"eval_{timestamp}.jsonl"
-    summary_path = output_dir / f"summary_{timestamp}.json"
+    submission_path = output_dir / f"{args.agent}_submission_{timestamp}.jsonl"
+    eval_path = output_dir / f"{args.agent}_eval_{timestamp}.jsonl"
+    summary_path = output_dir / f"{args.agent}_summary_{timestamp}.json"
 
     rows = load_jsonl(dataset_path, limit=50)
     if len(rows) != 50:
