@@ -143,9 +143,9 @@ def main() -> None:
     dataset_path = resolve_path(args.dataset)
     output_dir = resolve_path(args.output_dir)
     timestamp = datetime.now().strftime("%m%d_%H%M")
-    submission_path = output_dir / f"research_agent_hard50_submission_{timestamp}.jsonl"
-    eval_path = output_dir / f"research_agent_hard50_eval_{timestamp}.jsonl"
-    summary_path = output_dir / f"research_agent_hard50_summary_{timestamp}.json"
+    submission_path = output_dir / f"submission_{timestamp}.jsonl"
+    eval_path = output_dir / f"eval_{timestamp}.jsonl"
+    summary_path = output_dir / f"summary_{timestamp}.json"
 
     rows = load_jsonl(dataset_path, limit=50)
     if len(rows) != 50:
