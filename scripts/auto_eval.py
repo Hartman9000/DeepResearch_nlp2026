@@ -28,9 +28,9 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from agent.dataset_utils import load_jsonl
 from agent.eval import run_evaluation
-from agent.research_agent import run_research_agent
 from agent.tools import build_searcher, get_agent_tool_specs_and_registry
 from agent.vllm_client import VLLMClient
+from open_track.research_agent import run_research_agent
 
 
 def parse_args() -> argparse.Namespace:

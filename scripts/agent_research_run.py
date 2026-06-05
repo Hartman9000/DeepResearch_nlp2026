@@ -5,14 +5,29 @@ from pathlib import Path
 from typing import Any, Dict, List
 
 
-PROJECT_ROOT = Path.cwd()
+def find_project_root() -> Path:
+    script_path = Path(__file__).resolve()
+    candidates = [script_path.parent, *script_path.parents]
+
+    for candidate in candidates:
+        if (candidate / "agent").is_dir() and (candidate / "browsecomp_plus_hard50.jsonl").exists():
+            return candidate
+
+    for candidate in candidates:
+        if (candidate / "agent").is_dir():
+            return candidate
+
+    return Path.cwd()
+
+
+PROJECT_ROOT = find_project_root()
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.append(str(PROJECT_ROOT))
 
 from agent.dataset_utils import load_jsonl
-from agent.research_agent import run_research_agent
 from agent.tools import build_searcher, get_agent_tool_specs_and_registry
 from agent.vllm_client import VLLMClient
+from open_track.research_agent import run_research_agent
 
 
 def parse_args() -> argparse.Namespace:
@@ -31,7 +46,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--snippet-max-chars", type=int, default=1600, help="Maximum characters per search snippet.")
     parser.add_argument("--window-chars", type=int, default=1200, help="Characters returned by get_document_window.")
     parser.add_argument("--max-rounds", type=int, default=10, help="Maximum loop-agent rounds.")
-    parser.add_argument("--max-tokens", type=int, default=2048, help="max_tokens for all model calls.")
+    parser.add_argument("--max-tokens", type=int, default=4096, help="max_tokens for all model calls.")
     parser.add_argument(
         "--output",
         default=None,
@@ -47,18 +62,23 @@ def find_row_by_query_id(rows: List[Dict[str, Any]], query_id: str) -> Dict[str,
     raise ValueError(f"query_id not found: {query_id}")
 
 
+def resolve_path(path: str) -> Path:
+    resolved = Path(path)
+    if not resolved.is_absolute():
+        resolved = PROJECT_ROOT / resolved
+    return resolved
+
+
 def main() -> None:
     args = parse_args()
-    dataset_path = PROJECT_ROOT / args.dataset
-    output_path = Path(args.output) if args.output else PROJECT_ROOT / "runs" / f"research_agent_{args.query_id}.json"
-    if not output_path.is_absolute():
-        output_path = PROJECT_ROOT / output_path
+    dataset_path = resolve_path(args.dataset)
+    output_path = resolve_path(args.output) if args.output else PROJECT_ROOT / "runs" / f"research_agent_{args.query_id}.json"
 
     rows = load_jsonl(str(dataset_path))
     row = find_row_by_query_id(rows, args.query_id)
 
     client = VLLMClient(base_url=args.base_url, api_key=args.api_key)
-    searcher = build_searcher(index_path=args.index_path)
+    searcher = build_searcher(index_path=str(resolve_path(args.index_path)))
     tool_specs, tool_registry = get_agent_tool_specs_and_registry(
         searcher=searcher,
         k=args.top_k,
