@@ -240,7 +240,7 @@ def run_basic_agent(
     initial_query: Optional[str] = None,
 ) -> Dict[str, Any]:
     if search_fn is None:
-        from agent.tools import get_basic_tool_specs_and_registry
+        from .tools import get_basic_tool_specs_and_registry
 
         _, registry = get_basic_tool_specs_and_registry(
             searcher=searcher,

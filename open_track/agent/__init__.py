@@ -1,0 +1,1 @@
+"""OpenTrack research agent implementation."""

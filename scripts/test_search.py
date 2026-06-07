@@ -3,7 +3,7 @@ import json
 from pathlib import Path
 from typing import Any, Dict, List
 
-from agent.tools import build_searcher, get_search_tool_specs_and_registry
+from core.agent.tools import build_searcher, get_search_tool_specs_and_registry
 
 
 def parse_args() -> argparse.Namespace:

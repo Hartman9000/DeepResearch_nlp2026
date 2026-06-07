@@ -12,11 +12,11 @@ def find_project_root() -> Path:
     candidates = [script_path.parent, *script_path.parents]
 
     for candidate in candidates:
-        if (candidate / "agent").is_dir() and (candidate / "browsecomp_plus_hard50.jsonl").exists():
+        if (candidate / "core").is_dir() and (candidate / "browsecomp_plus_hard50.jsonl").exists():
             return candidate
 
     for candidate in candidates:
-        if (candidate / "agent").is_dir():
+        if (candidate / "core").is_dir():
             return candidate
 
     return Path.cwd()
@@ -26,12 +26,12 @@ PROJECT_ROOT = find_project_root()
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from agent.dataset_utils import load_jsonl
-from agent.eval import run_evaluation
-from agent.tools import build_searcher, get_agent_tool_specs_and_registry, get_basic_tool_specs_and_registry
-from agent.vllm_client import VLLMClient
-from basic.agent import run_basic_agent
-from open_track.research_agent import run_research_agent as run_open_track_agent
+from core.agent.dataset_utils import load_jsonl
+from core.agent.eval import run_evaluation
+from core.agent.tools import build_searcher, get_agent_tool_specs_and_registry, get_basic_tool_specs_and_registry
+from core.agent.vllm_client import VLLMClient
+from core.agent.agent import run_basic_agent
+from open_track.agent.research_agent import run_research_agent as run_open_track_agent
 
 
 def parse_args() -> argparse.Namespace:

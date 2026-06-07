@@ -25,21 +25,14 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from core.agent.dataset_utils import load_jsonl
-from core.agent.tools import build_searcher, get_agent_tool_specs_and_registry, get_basic_tool_specs_and_registry
+from core.agent.tools import build_searcher, get_agent_tool_specs_and_registry
 from core.agent.vllm_client import VLLMClient
-from core.agent.agent import run_basic_agent
-from open_track.agent.research_agent import run_research_agent as run_open_track_agent
+from open_track.agent.research_agent import run_research_agent
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Run the research agent on one BrowseComp-Plus query_id.")
+    parser = argparse.ArgumentParser(description="Run the OpenTrack agent on one BrowseComp-Plus query_id.")
     parser.add_argument("query_id", help="query_id in browsecomp_plus_hard50.jsonl")
-    parser.add_argument(
-        "--agent",
-        choices=["open_track", "basic"],
-        default="open_track",
-        help="Agent implementation to run.",
-    )
     parser.add_argument("--dataset", default="browsecomp_plus_hard50.jsonl", help="Path to the question JSONL file.")
     parser.add_argument(
         "--index-path",
@@ -54,17 +47,22 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--window-chars", type=int, default=1200, help="Characters returned by get_document_window.")
     parser.add_argument("--max-rounds", type=int, default=10, help="Maximum loop-agent rounds.")
     parser.add_argument("--max-tokens", type=int, default=4096, help="max_tokens for all model calls.")
-    parser.add_argument("--recent-rounds", type=int, default=3, help="Basic agent: recent search rounds kept in full context.")
+    parser.add_argument(
+        "--recent-rounds",
+        type=int,
+        default=3,
+        help="Accepted for CLI compatibility; the OpenTrack agent manages context internally.",
+    )
     parser.add_argument(
         "--context-snippet-chars",
         type=int,
         default=1200,
-        help="Basic agent: maximum snippet characters shown per recent result.",
+        help="Accepted for CLI compatibility; the OpenTrack agent manages context internally.",
     )
     parser.add_argument(
         "--output",
         default=None,
-        help="Output JSON path. Defaults to runs/research_agent_<query_id>.json or runs/basic_agent_<query_id>.json.",
+        help="Output JSON path. Defaults to open_track/eval/research_agent_<query_id>.json.",
     )
     return parser.parse_args()
 
@@ -83,65 +81,39 @@ def resolve_path(path: str) -> Path:
     return resolved
 
 
-def default_output_path(agent_name: str, query_id: str) -> Path:
-    if agent_name == "basic":
-        return PROJECT_ROOT / "runs" / f"basic_agent_{query_id}.json"
-    return PROJECT_ROOT / "runs" / f"research_agent_{query_id}.json"
+def default_output_path(query_id: str) -> Path:
+    return PROJECT_ROOT / "open_track" / "eval" / f"research_agent_{query_id}.json"
 
 
-def run_selected_agent(args: argparse.Namespace, question: str) -> Dict[str, Any]:
+def main() -> None:
+    args = parse_args()
+    dataset_path = resolve_path(args.dataset)
+    output_path = resolve_path(args.output) if args.output else default_output_path(args.query_id)
+
+    rows = load_jsonl(str(dataset_path))
+    row = find_row_by_query_id(rows, args.query_id)
+
     client = VLLMClient(base_url=args.base_url, api_key=args.api_key)
     searcher = build_searcher(index_path=str(resolve_path(args.index_path)))
-
-    if args.agent == "basic":
-        _tool_specs, tool_registry = get_basic_tool_specs_and_registry(
-            searcher=searcher,
-            k=args.top_k,
-            snippet_max_chars=args.snippet_max_chars,
-        )
-        return run_basic_agent(
-            client=client,
-            model=args.model,
-            question=question,
-            searcher=searcher,
-            search_fn=tool_registry["search"],
-            top_k=args.top_k,
-            max_rounds=args.max_rounds,
-            max_tokens=args.max_tokens,
-            snippet_max_chars=args.snippet_max_chars,
-            recent_rounds=args.recent_rounds,
-            context_snippet_chars=args.context_snippet_chars,
-        )
-
     tool_specs, tool_registry = get_agent_tool_specs_and_registry(
         searcher=searcher,
         k=args.top_k,
         snippet_max_chars=args.snippet_max_chars,
         window_chars=args.window_chars,
     )
-    return run_open_track_agent(
+
+    result = run_research_agent(
         client=client,
         model=args.model,
-        query=question,
+        query=row["query"],
         tool_specs=tool_specs,
         tool_registry=tool_registry,
         max_rounds=args.max_rounds,
         max_tokens=args.max_tokens,
     )
 
-
-def main() -> None:
-    args = parse_args()
-    dataset_path = resolve_path(args.dataset)
-    output_path = resolve_path(args.output) if args.output else default_output_path(args.agent, args.query_id)
-
-    rows = load_jsonl(str(dataset_path))
-    row = find_row_by_query_id(rows, args.query_id)
-
-    result = run_selected_agent(args, row["query"])
-
     output = {
-        "agent": args.agent,
+        "agent": "open_track",
         "query_id": row["query_id"],
         "query": row["query"],
         "gold_answer": row.get("answer", ""),
