@@ -1,300 +1,307 @@
-# NLP 课程项目：Deep Research Agent 实验指南
+# DeepResearch Agent
 
-本实验的目标是基于 `BrowseComp-Plus` 搭建一个能够进行多轮检索、维护中间状态、并基于证据给出最终答案的 agent。
+本项目实现了面向 BrowseComp-Plus hard50 的本地检索增强 Deep Research Agent。项目包含两个可运行版本：
 
-你们拿到的材料只有三部分：
+- `basic`：基础单 agent 循环检索版本，位于 `core/`。
+- `open_track`：Open Track 版本，加入更细粒度的 evidence extraction、状态更新、关键词窗口工具等模块，位于 `open_track/`。
 
-- `agent/` 文件夹
-- 数据集与语料
-- `agent_vllm.ipynb` 和 `agent_vllm_weather.ipynb`
+## 代码入口
 
-## 1. 实验目标
+### 单题推理
 
-本实验重点考察：
-
-1. 多轮检索 loop 与停止条件
-2. 历史与上下文管理
-3. Prompt 设计
-4. 基于证据的最终回答
-
-也就是说，你们要做的不是单次 `search -> answer`，而是一个能逐步推进问题求解的 Deep Research Agent。
-
-## 2. 你们会拿到什么
-
-### 2.1 notebook
-
-- [agent_vllm.ipynb](agent_vllm.ipynb)
-  - 单步 baseline
-- [agent_vllm_weather.ipynb](agent_vllm_weather.ipynb)
-  - 本地工具调用链路演示
-
-### 2.2 `agent/` 目录
-
-- [agent/browsecomp_searcher.py](agent/browsecomp_searcher.py)
-  - 本地 BM25 检索实现
-- [agent/build_bm25_index.py](agent/build_bm25_index.py)
-  - 构建 BM25 索引
-- [agent/tools.py](agent/tools.py)
-  - 检索工具定义
-- [agent/vllm_client.py](agent/vllm_client.py)
-  - 调用 vLLM 服务
-- [agent/dataset_utils.py](agent/dataset_utils.py)
-  - 读取数据集
-- [agent/pangu_tool_parser.py](agent/pangu_tool_parser.py)
-  - Pangu 工具调用 parser
-- [agent/pangu_chat_template.jinja](agent/pangu_chat_template.jinja)
-  - Pangu chat template
-- [agent/eval.py](agent/eval.py)
-  - 自动评估脚本，使用 LLM 判断预测答案与标准答案是否一致
-
-### 2.3 数据
-
-- `browsecomp-plus-corpus/`
-  - 全量离线语料
-- `browsecomp_plus_hard50.jsonl`
-  - 课堂调试样例集
-
-## 3. 下载模型
-
-首先在终端中克隆所需模型（二选一，推荐 Qwen）：
+运行 basic agent：
 
 ```bash
-cd nlp-exp
-# Qwen3-8B（推荐）
-git clone https://atomgit.com/hf_mirrors/MindSpore-Lab/Qwen3-8B.git
-
-# openPangu-Embedded-7B（备选）
-git clone https://atomgit.com/ascend-tribe/openPangu-Embedded-7B-DeepDiver.git
+python core/run.py 442
 ```
 
-## 4. 启动 vLLM 服务
-
-### 4.1 Qwen 路线
-
-```bash
-vllm serve ./Qwen3-8B \
-  --served-model-name qwen_auto \
-  --enable-auto-tool-choice \
-  --tool-call-parser hermes \
-  --trust-remote-code \
-  --host 0.0.0.0 \
-  --port 8000
-```
-
-### 4.2 Pangu 路线
-
-```bash
-vllm serve ./openPangu-Embedded-7B-DeepDiver \
-  --served-model-name pangu_auto \
-  --enable-auto-tool-choice \
-  --tool-parser-plugin agent/pangu_tool_parser.py \
-  --tool-call-parser pangu_deepdiver \
-  --chat-template agent/pangu_chat_template.jinja \
-  --trust-remote-code \
-  --host 0.0.0.0 \
-  --port 8000
-```
-
-服务地址默认写成：
+默认结果保存到：
 
 ```text
-http://127.0.0.1:8000/v1
+eval/basic_agent_442.json
 ```
 
-说明：
-
-- `vLLM` 需要在 `Jupyter` 之外单独启动
-- 启动后需要一直保持在终端中运行
-- notebook 只负责调用已经启动好的 `vLLM` 服务
-
-## 5. Jupyter 使用方式
-
-打开课程提供的 Jupyter 环境后，建议先查看：
-
-1. agent_vllm_weather.ipynb
-2. agent_vllm.ipynb
-
-说明：
-
-- 依赖安装与 notebook 内环境准备步骤，已经写在 notebook 中
-- 请先在终端启动并保持 `vLLM` 运行，再打开 notebook
-
-## 6. 推荐实验流程
-
-建议按下面顺序完成：
-
-1. 跑通 `agent_vllm.ipynb`
-2. 理解单步 baseline
-3. 参考 `agent_vllm_weather.ipynb` agent实现
-4. 自己实现多轮 agent loop
-5. 加入 query 改写、状态管理和停止条件
-6. 在 `hard50` 或开发集上调试
-7. 导出统一格式结果
-
-## 7. 实验要求
-
-### 6.1 必做内容
-
-你们需要在 baseline 基础上完成：
-
-1. 多轮检索 loop
-2. 明确的停止条件
-3. 历史与上下文管理
-4. Prompt 设计
-5. 基于证据的最终回答
-
-### 6.2 限制
-
-- 不允许替换检索器
-- 不允许使用额外外部检索服务（google/bing）
-- 不允许引入 benchmark 外部知识库
-
-### 6.3 推荐改进方向
-
-- query reformulation
-- 维护已确认事实与待确认子问题
-- 历史信息压缩
-- 避免重复搜索
-- 最终答案前做证据校验
-
-## 8. 自动评估
-
-我们提供了自动评估脚本 `agent/eval.py`，使用 LLM 自动判断你的预测答案与标准答案是否一致，并输出准确率（acc）和详细评估结果。
-
-使用方法：
+运行 Open Track agent：
 
 ```bash
-python -m agent.eval \
-  --submission runs/submission.jsonl \
-  --dataset browsecomp_plus_hard50.jsonl \
-  --model Qwen3-8B \
+python open_track/run.py 442
+```
+
+默认结果保存到：
+
+```text
+open_track/eval/research_agent_442.json
+```
+
+也可以继续使用统一脚本：
+
+```bash
+python scripts/agent_run.py 442 --agent basic
+python scripts/agent_run.py 442 --agent open_track
+```
+
+统一脚本默认保存到 `runs/`，主要用于兼容已有实验流程。
+
+## 运行环境
+
+推荐环境：
+
+- Python 3.10+
+- 本地可用的 OpenAI-compatible `/chat/completions` 服务
+- 默认模型服务地址：`http://127.0.0.1:8000/v1`
+- 默认模型名：`qwen_auto`
+
+本项目的 agent 代码通过 `core.agent.vllm_client.VLLMClient` 调用模型服务。只要服务兼容 OpenAI Chat Completions API，即可通过参数替换：
+
+```bash
+--base-url http://127.0.0.1:8000/v1
+--model qwen_auto
+--api-key dummy
+```
+
+检索侧使用本地 SQLite FTS5 BM25 索引。默认索引路径为：
+
+```text
+indexes/browsecomp_plus_bm25.sqlite
+```
+
+题库文件默认放在项目根目录：
+
+```text
+browsecomp_plus_hard50.jsonl
+```
+
+语料目录默认使用：
+
+```text
+browsecomp-plus-corpus/
+```
+
+## 依赖安装方式
+
+安装 Python 依赖：
+
+```bash
+pip install -r core/agent/requirements.txt
+```
+
+当前 `requirements.txt` 只包含项目侧必要依赖：
+
+```text
+pyarrow
+python-dotenv
+```
+
+如果需要自己启动 vLLM 或其他模型服务，请额外安装对应推理框架。本仓库不强制绑定某个模型服务实现，只要求暴露 OpenAI-compatible API。
+
+## 索引构建
+
+如果 `indexes/browsecomp_plus_bm25.sqlite` 已存在，可以直接运行 agent。若需要重新构建索引：
+
+```bash
+python -m core.agent.build_bm25_index \
+  --corpus-path ./browsecomp-plus-corpus \
+  --index-path ./indexes/browsecomp_plus_bm25.sqlite \
+  --overwrite
+```
+
+构建完成后，搜索工具和 agent 会默认读取该索引。
+
+## 评测命令
+
+评测脚本会在 hard50 全部 50 道题上运行 agent，并调用 LLM judge 判断预测答案是否正确。
+
+评测 basic agent：
+
+```bash
+python scripts/auto_eval.py --agent basic
+```
+
+默认输出到：
+
+```text
+eval/
+```
+
+评测 Open Track agent：
+
+```bash
+python scripts/auto_eval.py --agent open_track
+```
+
+默认输出到：
+
+```text
+open_track/eval/
+```
+
+每次评测会生成三类带时间戳的文件：
+
+```text
+{agent}_submission_{MMDD_HHMM}.jsonl
+{agent}_eval_{MMDD_HHMM}.jsonl
+{agent}_summary_{MMDD_HHMM}.json
+```
+
+常用参数：
+
+```bash
+python scripts/auto_eval.py \
+  --agent open_track \
   --base-url http://127.0.0.1:8000/v1 \
-  --output runs/eval_results.jsonl
+  --model qwen_auto \
+  --eval-model qwen_auto \
+  --max-rounds 10 \
+  --max-tokens 4096
 ```
 
-你也可以在 notebook 中直接调用 `run_evaluation()` 函数进行评估。
+## 工具测试命令
 
-## 9. 统一输出与提交格式
+直接测试搜索工具：
 
-为了方便老师审核和自动化评估，所有同学都需要按统一格式提交结果。
+```bash
+python scripts/test_search.py "EARLY EXPLORERS IN AUSTRALIA"
+```
 
-### 9.1 提交文件
+查看某个文档中关键词附近窗口：
 
-最终提交文件命名格式：
+```bash
+python scripts/test_doc_window.py 18896 Cunningham
+```
+
+这两个脚本用于调试检索结果，便于分析 agent 为什么找到或没找到关键证据。
+
+## 主要文件说明
 
 ```text
-学号-姓名-submission-最终得分.jsonl
+core/
+  run.py
+    basic agent 的单题推理入口。
+
+  agent/
+    agent.py
+      basic agent 主流程。
+
+    prompts.py
+      basic agent 使用的 prompt。
+
+    tools.py
+      search、get_document_window 等工具封装，以及不同 agent 使用的 tool registry。
+
+    browsecomp_searcher.py
+      SQLite FTS5 BM25 检索器与 snippet 处理逻辑。
+
+    build_bm25_index.py
+      从 BrowseComp-Plus corpus 构建本地 BM25 索引。
+
+    dataset_utils.py
+      JSONL 数据读取工具。
+
+    eval.py
+      LLM judge 自动评测逻辑。
+
+    vllm_client.py
+      OpenAI-compatible Chat Completions 客户端。
+
+open_track/
+  run.py
+    Open Track agent 的单题推理入口。
+
+  agent/
+    research_agent.py
+      Open Track agent 主流程。
+
+    prompts.py
+      parse、extract、update、loop 等模块使用的 prompt。
+
+    tooling.py
+      Open Track agent 的工具执行、结果合并和 snippet 压缩。
+
+    model_io.py
+      模型调用与 agent 输入输出记录。
+
+    normalization.py
+      query、constraint、status 等结构的规范化。
+
+scripts/
+  agent_run.py
+    兼容旧流程的统一单题运行脚本，可通过 `--agent` 选择 basic/open_track。
+
+  auto_eval.py
+    hard50 自动推理与评测脚本。
+
+  test_search.py
+    搜索工具调试脚本。
+
+  test_doc_window.py
+    文档关键词窗口工具调试脚本。
+
+  ablation_eval.py
+    Open Track 消融实验脚本。
+
+eval/
+  basic agent 默认评测输出目录。
+
+open_track/eval/
+  Open Track agent 默认评测输出目录。
+
+runs/
+  历史实验、兼容脚本或手动指定输出目录。
+
+indexes/
+  本地 BM25 SQLite 索引。
+
+docs/
+  实验报告与相关文档。
 ```
 
-### 9.2 单题结果格式
+## Open Track 运行说明
 
-`submission.jsonl` 采用 `JSON Lines` 格式：
+Open Track 版本位于 `open_track/`，入口为：
 
-- 每一行对应一道题
-- 每一行都是一个完整 JSON 对象
-- 每个 JSON 对象同时包含最终答案和完整轨迹
-
-单题至少包含：
-
-```json
-{
-  "query_id": "442",
-  "predicted_answer": "THE DAWN OF AUSTRALIAN COLONISATION",
-  "status": "completed",
-  "messages": [
-    {
-      "role": "system",
-      "content": "你是一个 Deep Research Agent ..."
-    },
-    {
-      "role": "user",
-      "content": "原始题目文本"
-    },
-    {
-      "role": "assistant",
-      "content": "",
-      "tool_calls": [
-        {
-          "id": "call_1",
-          "type": "function",
-          "function": {
-            "name": "search",
-            "arguments": "{\"query\": \"...\"}"
-          }
-        }
-      ]
-    },
-    {
-      "role": "tool",
-      "tool_call_id": "call_1",
-      "content": "工具返回结果或结果摘要"
-    },
-    {
-      "role": "assistant",
-      "content": "Explanation: ...\nExact Answer: THE DAWN OF AUSTRALIAN COLONISATION\nConfidence: 72%"
-    }
-  ]
-}
+```bash
+python open_track/run.py <query_id>
 ```
 
-其中建议作为必填字段：
+例如：
 
-- `query_id`
-- `status`
-- `predicted_answer`
-- `messages`
-
-除了上面这些字段，不要求额外提交派生统计字段。像下面这些信息都可以由评测脚本从完整 `messages` 中还原或统计：
-
-- 工具调用次数
-- 检索到过的文档 id
-- 最终一轮 assistant 输出
-- 每一轮 tool call / tool result 对应关系
-
-### 9.3 消息格式
-
-为了能完整还原整个对话过程，建议直接按时间顺序记录 `messages`。
-
-建议支持下面几类 message：
-
-```json
-{
-  "role": "assistant",
-  "content": "",
-  "tool_calls": [
-    {
-      "id": "call_1",
-      "type": "function",
-      "function": {
-        "name": "search",
-        "arguments": "{\"query\": \"...\"}"
-      }
-    }
-  ]
-}
+```bash
+python open_track/run.py 442 \
+  --max-rounds 10 \
+  --max-tokens 4096 \
+  --top-k 6 \
+  --snippet-max-chars 1600 \
+  --window-chars 1200
 ```
 
-推荐约定如下：
+Open Track agent 相比 basic agent 额外使用：
 
-- `system` / `user` / `assistant` / `tool` 都统一放进 `messages`
-- `assistant` 如果发起工具调用，就在该条 message 中记录 `tool_calls`
-- `tool` message 记录工具返回内容，并通过 `tool_call_id` 对应到上一条 `assistant.tool_calls`
-- 最终答案就是最后一条 `assistant` message 的 `content`
+- `search`：检索候选文档和桥接实体。
+- `get_document_window`：在已知 `docid` 内查找单个关键词附近窗口。
+- 多阶段 prompt：解析题目、抽取证据、更新状态、决定下一步调查。
 
-如果你们实现了显式状态管理，建议额外加入但不要重复正文：
+Open Track 的评测命令：
 
-- `state_summary`
-- `current_subgoal`
-- `next_action_plan`
+```bash
+python scripts/auto_eval.py --agent open_track
+```
 
-这样老师可以同时检查：
+默认输出到：
 
-- 最终答案是否正确
-- 整个对话过程是否能被完整还原
-- 检索和决策过程是否合理
+```text
+open_track/eval/
+```
 
-## 10. 一句话提醒
+## Notebook
 
-这次实验的目标不是让模型搜一次就猜答案，而是让它在固定检索环境中，逐步推进、保留证据、最后输出一个可以检查的答案。
+项目保留了两个 notebook：
 
-tip：使用 `agent/eval.py` 可以自动评估你的 agent 效果，无需手动比对答案。
+- `agent_vllm.ipynb`：基础 RAG / agent 调用流程示例。
+- `agent_vllm_weather.ipynb`：使用模拟天气工具测试 vLLM tool calling。
+
+Notebook 中的导入路径已经更新为新结构，例如：
+
+```python
+from core.agent.vllm_client import VLLMClient
+from core.agent.tools import build_searcher
+```

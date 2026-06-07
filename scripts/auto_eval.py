@@ -63,7 +63,11 @@ def parse_args() -> argparse.Namespace:
         default=1200,
         help="Basic agent: maximum snippet characters shown per recent result.",
     )
-    parser.add_argument("--output-dir", default="runs", help="Directory for submission, eval, and summary files.")
+    parser.add_argument(
+        "--output-dir",
+        default=None,
+        help="Directory for submission, eval, and summary files. Defaults to eval/ for basic and open_track/eval/ for open_track.",
+    )
     return parser.parse_args()
 
 
@@ -72,6 +76,12 @@ def resolve_path(path: str) -> Path:
     if not resolved.is_absolute():
         resolved = PROJECT_ROOT / resolved
     return resolved
+
+
+def default_output_dir(agent_name: str) -> Path:
+    if agent_name == "basic":
+        return PROJECT_ROOT / "eval"
+    return PROJECT_ROOT / "open_track" / "eval"
 
 
 def build_error_record(row: Dict[str, Any], exc: BaseException) -> Dict[str, Any]:
@@ -185,7 +195,7 @@ def print_summary(summary: Dict[str, Any]) -> None:
 def main() -> None:
     args = parse_args()
     dataset_path = resolve_path(args.dataset)
-    output_dir = resolve_path(args.output_dir)
+    output_dir = resolve_path(args.output_dir) if args.output_dir else default_output_dir(args.agent)
     timestamp = datetime.now().strftime("%m%d_%H%M")
     submission_path = output_dir / f"{args.agent}_submission_{timestamp}.jsonl"
     eval_path = output_dir / f"{args.agent}_eval_{timestamp}.jsonl"
